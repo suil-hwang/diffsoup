@@ -1,6 +1,9 @@
 #include "rasterize.cuh"
 #include "cuda_common.cuh"
 
+#include <climits>
+
+#include <cub/cub.cuh>
 #include <thrust/device_ptr.h>
 #include <thrust/scan.h>
 
@@ -16,28 +19,24 @@ __device__ __forceinline__ int outcode4(float x, float y, float z, float w) {
 }
 
 __device__ __forceinline__ void accum_ndc4(
-    float x, float y, float z, float w,
-    float& xmin, float& ymin, float& zmin,
-    float& xmax, float& ymax, float& zmax)
+    float x, float y, float w,
+    float& xmin, float& ymin,
+    float& xmax, float& ymax)
 {
     const float invw = 1.f / w;
     float nx = x * invw;
     float ny = y * invw;
-    float nz = z * invw;
 
     // Guard nans/infs: clamp toward boundary to stay conservative
     if (!isfinite(nx)) nx = (nx > 0.f ? 1.f : -1.f);
     if (!isfinite(ny)) ny = (ny > 0.f ? 1.f : -1.f);
-    if (!isfinite(nz)) nz = (nz > 0.f ? 1.f : -1.f);
 
     // Clamp to clip cube
     nx = fminf(1.f, fmaxf(-1.f, nx));
     ny = fminf(1.f, fmaxf(-1.f, ny));
-    nz = fminf(1.f, fmaxf(-1.f, nz));
 
     xmin = fminf(xmin, nx);  xmax = fmaxf(xmax, nx);
     ymin = fminf(ymin, ny);  ymax = fmaxf(ymax, ny);
-    zmin = fminf(zmin, nz);  zmax = fmaxf(zmax, nz);
 }
 
 __global__ void compute_triangle_rects_kernel(
@@ -90,20 +89,13 @@ __global__ void compute_triangle_rects_kernel(
         frag_counts[idx]=0; return;
     }
 
-    // Project to NDC and clamp to [-1,1]
-    float xmin =  1.f, ymin =  1.f, zmin =  1.f;
-    float xmax = -1.f, ymax = -1.f, zmax = -1.f;
+    // Project to NDC and clamp XY to [-1,1]. Z trivial reject is handled by outcode4().
+    float xmin =  1.f, ymin =  1.f;
+    float xmax = -1.f, ymax = -1.f;
 
-    accum_ndc4(p0x,p0y,p0z,p0w, xmin,ymin,zmin, xmax,ymax,zmax);
-    accum_ndc4(p1x,p1y,p1z,p1w, xmin,ymin,zmin, xmax,ymax,zmax);
-    accum_ndc4(p2x,p2y,p2z,p2w, xmin,ymin,zmin, xmax,ymax,zmax);
-
-    // Z reject in NDC
-    if (zmax < -1.f || zmin > 1.f) {
-        triangle_rects[idx*4+0]=0; triangle_rects[idx*4+1]=0;
-        triangle_rects[idx*4+2]=0; triangle_rects[idx*4+3]=0;
-        frag_counts[idx]=0; return;
-    }
+    accum_ndc4(p0x,p0y,p0w, xmin,ymin, xmax,ymax);
+    accum_ndc4(p1x,p1y,p1w, xmin,ymin, xmax,ymax);
+    accum_ndc4(p2x,p2y,p2w, xmin,ymin, xmax,ymax);
 
     // NDC -> pixel bbox (exclusive max)
     const float fH = static_cast<float>(H);
@@ -213,11 +205,13 @@ __global__ void compute_fragments_kernel(
     int num_frags,
     const int* frag_prefix_sum,  // [T]
     const int* triangle_rects,   // [T, 4]
-    int* frag_pix,               // [num_frags, 3]
+    int* frag_pix,               // [num_frags, 4]
     float* frag_attrs            // [num_frags, 4]
 ) {
     const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_frags) return;
+
+    frag_pix[idx * 4 + 0] = -1;
 
     // Binary search to find triangle index
     int lo = 0, hi = num_tris;
@@ -267,9 +261,7 @@ __global__ void compute_fragments_kernel(
 
     if (!(depth >= -1.f && depth <= 1.f)) return;
 
-    frag_pix[idx * 3 + 0] = batch_idx;
-    frag_pix[idx * 3 + 1] = y;
-    frag_pix[idx * 3 + 2] = x;
+    reinterpret_cast<int4*>(frag_pix)[idx] = make_int4(batch_idx, y, x, batch_tri);
     frag_attrs[idx * 4 + 0] = b0;
     frag_attrs[idx * 4 + 1] = b1;
     frag_attrs[idx * 4 + 2] = depth;
@@ -305,34 +297,38 @@ void compute_fragments(
 }
 
 // --- Packing Helpers ---
-__device__ __forceinline__ long long pack_depth_and_index(float zw, int index) {
-    int zw_bits;
-    memcpy(&zw_bits, &zw, sizeof(float)); // reinterpret float as int bits
-    return (static_cast<long long>(zw_bits) << 32) | static_cast<unsigned int>(index);
+__device__ __forceinline__ unsigned long long pack_depth_and_index(float zw, unsigned int index) {
+    const unsigned int zw_bits = __float_as_uint(zw);
+    return (static_cast<unsigned long long>(zw_bits) << 32) |
+           static_cast<unsigned long long>(index);
 }
 
-__device__ __forceinline__ int unpack_index(long long packed) {
-    return static_cast<int>(packed & 0xFFFFFFFFLL);
+__device__ __forceinline__ int unpack_index(unsigned long long packed) {
+    return static_cast<int>(packed & 0xFFFFFFFFULL);
 }
 
 // --- Depth Test Kernel ---
 __global__ void depth_test_kernel(
-    int H, int W,
+    int B, int H, int W,
     int num_frags,
-    const int* __restrict__ frag_pix,        // [num_frags, 3]
+    const int* __restrict__ frag_pix,        // [num_frags, 4]
     const float* __restrict__ frag_attrs,    // [num_frags, 4]
     const float* __restrict__ frag_alpha,    // [num_frags]
     const float* __restrict__ alpha_thresh,  // [num_frags]
-    long long* frag_index                    // [B, H, W], initialized to LLONG_MAX
+    unsigned long long* frag_index           // [B, H, W], initialized to ULLONG_MAX
 ) {
     const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_frags) return;
 
-    const int batch = frag_pix[idx * 3 + 0];
-    if (batch < 0) return;
+    const int4 pix = reinterpret_cast<const int4*>(frag_pix)[idx];
+    const int batch = pix.x;
+    if ((unsigned)batch >= (unsigned)B) return;
 
-    const int y = frag_pix[idx * 3 + 1];
-    const int x = frag_pix[idx * 3 + 2];
+    const int y = pix.y;
+    const int x = pix.z;
+    if ((unsigned)y >= (unsigned)H) return;
+    if ((unsigned)x >= (unsigned)W) return;
+
     const int pixel = batch * H * W + y * W + x;
 
     if (frag_alpha[idx] < alpha_thresh[idx]) return;
@@ -340,20 +336,22 @@ __global__ void depth_test_kernel(
     const float zw = frag_attrs[idx * 4 + 2];
     if (zw <= -1.f || !isfinite(zw)) return;
 
-    const long long packed = pack_depth_and_index(zw + 2.f, static_cast<int>(idx));
+    const unsigned long long packed = pack_depth_and_index(zw + 2.f, idx);
     atomicMin(&frag_index[pixel], packed);
 }
 
 __global__ void gather_depth_test_kernel(
     int B, int H, int W,
-    const long long* __restrict__ frag_index,  // [B, H, W]
+    const unsigned long long* __restrict__ frag_index,  // [B, H, W]
     const float* __restrict__ frag_attrs,      // [num_frags, 4]
     float* __restrict__ rast_out               // [B, H, W, 4]
 ) {
     const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= B * H * W) return;
 
-    const long long packed = frag_index[idx];
+    const unsigned long long packed = frag_index[idx];
+    if (packed == ULLONG_MAX) return;
+
     const int i_frag = unpack_index(packed);
 
     if (i_frag < 0) return;
@@ -364,30 +362,46 @@ __global__ void gather_depth_test_kernel(
     }
 }
 
-__global__ void fill_ll_max(long long* arr, int N) {
+__global__ void init_depth_and_rast(
+    unsigned long long* frag_index,
+    float* rast_out,
+    int total_pixels)
+{
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < N) arr[idx] = LLONG_MAX;
+    if (idx >= total_pixels) return;
+
+    frag_index[idx] = ULLONG_MAX;
+
+    const int pix = static_cast<int>(idx);
+    rast_out[pix * 4 + 0] = 0.f;
+    rast_out[pix * 4 + 1] = 0.f;
+    rast_out[pix * 4 + 2] = 0.f;
+    rast_out[pix * 4 + 3] = 0.f;
 }
 
 void depth_test(
     int B, int H, int W,
     int num_frags,
-    const int* frag_pix,       // [num_frags, 3]
+    const int* frag_pix,       // [num_frags, 4]
     const float* frag_attrs,   // [num_frags, 4]
     const float* frag_alpha,   // [num_frags]
     const float* alpha_thresh, // [num_frags]
     float* rast_out            // [B, H, W, 4]
 ) {
-    if (num_frags == 0) return;
-
     const int total = B * H * W;
+    if (total <= 0) return;
 
-    long long* frag_index = nullptr;
-    CUDA_CHECK(cudaMalloc(&frag_index, sizeof(long long) * total));
-    fill_ll_max<<<CUDA_BLOCKS(total), CUDA_THREADS>>>(frag_index, total);
+    if (num_frags == 0) {
+        CUDA_CHECK(cudaMemset(rast_out, 0, sizeof(float) * total * 4));
+        return;
+    }
+
+    unsigned long long* frag_index = nullptr;
+    CUDA_CHECK(cudaMalloc(&frag_index, sizeof(unsigned long long) * total));
+    init_depth_and_rast<<<CUDA_BLOCKS(total), CUDA_THREADS>>>(frag_index, rast_out, total);
 
     depth_test_kernel<<<CUDA_BLOCKS(num_frags), CUDA_THREADS>>>(
-        H, W, num_frags, frag_pix, frag_attrs,
+        B, H, W, num_frags, frag_pix, frag_attrs,
         frag_alpha, alpha_thresh, frag_index
     );
 
@@ -399,89 +413,135 @@ void depth_test(
     CUDA_CHECK(cudaGetLastError()); // catch kernel errors
 }
 
-__global__ void filter_valid_fragments_kernel(
+__global__ void mark_valid_fragments_kernel(
+    int B, int H, int W,
     int num_frags,
-    const int* __restrict__ frag_pix,        // [num_frags, 3]
+    const int* __restrict__ frag_pix,        // [num_frags, 4]
     const float* __restrict__ frag_attrs,    // [num_frags, 4]
-    int* __restrict__ frag_pix_out,          // [num_frags, 3] (preallocated)
-    float* __restrict__ frag_attrs_out,      // [num_frags, 4]
-    int* __restrict__ global_counter         // [1]
+    int* __restrict__ valid_flags,           // [num_frags]
+    int* __restrict__ block_counts           // [gridDim.x]
 ) {
-    extern __shared__ int shared_scan[]; // shared memory for scan and block count
-    int* valid_flags = shared_scan;
-    int* block_base  = shared_scan + blockDim.x;
+    using BlockReduce = cub::BlockReduce<int, CUDA_THREADS>;
+    __shared__ typename BlockReduce::TempStorage reduce_temp;
 
-    unsigned int tid = threadIdx.x;
-    unsigned int idx = blockIdx.x * blockDim.x + tid;
-
-    // Step 1: Each thread checks if valid
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int is_valid = 0;
+
     if (idx < num_frags) {
-        int frag_val = frag_pix[3 * idx + 0];
-        is_valid = (frag_val >= 0);
+        const int4 pix = reinterpret_cast<const int4*>(frag_pix)[idx];
+        const float depth = frag_attrs[4 * idx + 2];
+        const float tid_attr = frag_attrs[4 * idx + 3];
+
+        is_valid =
+            ((unsigned)pix.x < (unsigned)B) &&
+            ((unsigned)pix.y < (unsigned)H) &&
+            ((unsigned)pix.z < (unsigned)W) &&
+            pix.w >= 0 &&
+            isfinite(depth) &&
+            depth >= -1.f && depth <= 1.f &&
+            isfinite(tid_attr) &&
+            tid_attr > 0.f;
+
+        valid_flags[idx] = is_valid;
     }
-    valid_flags[tid] = is_valid;
-    __syncthreads();
 
-    // Step 2: Inclusive scan (Hillis-Steele)
-    for (int offset = 1; offset < blockDim.x; offset <<= 1) {
-        int temp = 0;
-        if (tid >= offset)
-            temp = valid_flags[tid - offset];
-        __syncthreads();
-        valid_flags[tid] += temp;
-        __syncthreads();
-    }
+    const int block_total = BlockReduce(reduce_temp).Sum(is_valid);
+    if (threadIdx.x == 0) block_counts[blockIdx.x] = block_total;
+}
 
-    // Step 3: First thread in block gets total count
-    if (tid == blockDim.x - 1) {
-        int total = valid_flags[tid];
-        block_base[0] = atomicAdd(global_counter, total);
-    }
-    __syncthreads();
+__global__ void scatter_valid_fragments_kernel(
+    int num_frags,
+    const int* __restrict__ valid_flags,     // [num_frags]
+    const int* __restrict__ block_offsets,   // [gridDim.x]
+    const int* __restrict__ frag_pix,        // [num_frags, 4]
+    const float* __restrict__ frag_attrs,    // [num_frags, 4]
+    int* __restrict__ frag_pix_out,          // [num_frags, 4] (preallocated)
+    float* __restrict__ frag_attrs_out       // [num_frags, 4]
+) {
+    using BlockScan = cub::BlockScan<int, CUDA_THREADS>;
+    __shared__ typename BlockScan::TempStorage scan_temp;
 
-    // Step 4: Write to output if valid
-    if (idx < num_frags && is_valid) {
-        int local_idx = (tid > 0) ? valid_flags[tid - 1] : 0;
-        int output_idx = block_base[0] + local_idx;
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int is_valid = (idx < num_frags) ? valid_flags[idx] : 0;
 
-        // Copy frag_pix (3 ints)
-        for (int i = 0; i < 3; ++i)
-            frag_pix_out[3 * output_idx + i] = frag_pix[3 * idx + i];
+    int local_offset = 0;
+    BlockScan(scan_temp).ExclusiveSum(is_valid, local_offset);
 
-        // Copy frag_attrs (4 floats)
-        for (int i = 0; i < 4; ++i)
-            frag_attrs_out[4 * output_idx + i] = frag_attrs[4 * idx + i];
-    }
+    if (idx >= num_frags || !is_valid) return;
+
+    const int output_idx = block_offsets[blockIdx.x] + local_offset;
+
+    reinterpret_cast<int4*>(frag_pix_out)[output_idx] =
+        reinterpret_cast<const int4*>(frag_pix)[idx];
+    reinterpret_cast<float4*>(frag_attrs_out)[output_idx] =
+        reinterpret_cast<const float4*>(frag_attrs)[idx];
 }
 
 int filter_valid_fragments(
+    int B, int H, int W,
     int num_frags,
-    const int* frag_pix,         // [num_frags, 3]
+    const int* frag_pix,         // [num_frags, 4]
     const float* frag_attrs,     // [num_frags, 4]
-    int* frag_pix_out,           // [num_frags, 3]
+    int* frag_pix_out,           // [num_frags, 4]
     float* frag_attrs_out        // [num_frags, 4]
 ) {
     int valid_count = 0;
-    if (num_frags == 0) return valid_count;
+    if (B <= 0 || H <= 0 || W <= 0 || num_frags == 0) return valid_count;
 
-    int* global_counter = nullptr;
-    CUDA_CHECK(cudaMalloc(&global_counter, sizeof(int)));
-    CUDA_CHECK(cudaMemset(global_counter, 0, sizeof(int)));
+    const int num_blocks = CUDA_BLOCKS(num_frags);
+    int* valid_flags = nullptr;
+    int* block_counts = nullptr;
+    int* block_offsets = nullptr;
+    void* scan_temp = nullptr;
+    size_t scan_temp_bytes = 0;
 
-    const size_t shared_mem = sizeof(int) * (CUDA_THREADS + 1);
+    CUDA_CHECK(cudaMalloc(&valid_flags, sizeof(int) * num_frags));
+    CUDA_CHECK(cudaMalloc(&block_counts, sizeof(int) * num_blocks));
+    CUDA_CHECK(cudaMalloc(&block_offsets, sizeof(int) * num_blocks));
 
-    filter_valid_fragments_kernel<<<CUDA_BLOCKS(num_frags), CUDA_THREADS, shared_mem>>>(
+    mark_valid_fragments_kernel<<<num_blocks, CUDA_THREADS>>>(
+        B, H, W,
         num_frags,
         frag_pix,
         frag_attrs,
-        frag_pix_out,
-        frag_attrs_out,
-        global_counter
+        valid_flags,
+        block_counts
     );
 
-    CUDA_CHECK(cudaMemcpy(&valid_count, global_counter, sizeof(int), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaFree(global_counter));
+    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        nullptr,
+        scan_temp_bytes,
+        block_counts,
+        block_offsets,
+        num_blocks));
+    CUDA_CHECK(cudaMalloc(&scan_temp, scan_temp_bytes));
+    CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        scan_temp,
+        scan_temp_bytes,
+        block_counts,
+        block_offsets,
+        num_blocks));
+
+    scatter_valid_fragments_kernel<<<num_blocks, CUDA_THREADS>>>(
+        num_frags,
+        valid_flags,
+        block_offsets,
+        frag_pix,
+        frag_attrs,
+        frag_pix_out,
+        frag_attrs_out
+    );
+
+    int last_offset = 0;
+    int last_count = 0;
+    CUDA_CHECK(cudaMemcpy(&last_offset, block_offsets + num_blocks - 1, sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&last_count, block_counts + num_blocks - 1, sizeof(int), cudaMemcpyDeviceToHost));
+    valid_count = last_offset + last_count;
+
+    CUDA_CHECK(cudaFree(scan_temp));
+    CUDA_CHECK(cudaFree(block_offsets));
+    CUDA_CHECK(cudaFree(block_counts));
+    CUDA_CHECK(cudaFree(valid_flags));
     CUDA_CHECK(cudaGetLastError()); // catch kernel errors
     return valid_count;
 }
@@ -558,6 +618,9 @@ bool find_edge_intersection(
     const float p1x = pos[v1*4+0], p1y = pos[v1*4+1], p1w = pos[v1*4+3];
     const float p2x = pos[v2*4+0], p2y = pos[v2*4+1], p2w = pos[v2*4+3];
 
+    if (!isfinite(p0w) || !isfinite(p1w) || !isfinite(p2w)) return false;
+    if (fabsf(p0w) <= 1e-20f || fabsf(p1w) <= 1e-20f || fabsf(p2w) <= 1e-20f) return false;
+
     const float r0x = p0x / p0w, r0y = p0y / p0w;
     const float r1x = p1x / p1w, r1y = p1y / p1w;
     const float r2x = p2x / p2w, r2y = p2y / p2w;
@@ -582,6 +645,8 @@ bool find_edge_intersection(
         return false;
     }
 
+    if (!isfinite(ix) || !isfinite(iy)) return false;
+
     // Perspective-correct edge parameter t using both x & y (branch-light)
     const float dx = Bx - Ax;
     const float dy = By - Ay;
@@ -594,7 +659,9 @@ bool find_edge_intersection(
     const float by = dy - iy * dw;
 
     const float denom = bx*bx + by*by;
-    const float t = (denom != 0.0f) ? -(ax*bx + ay*by) / denom : 0.5f; // homogeneous midpoint if degenerate
+    float t = (denom > 1e-20f) ? -(ax*bx + ay*by) / denom : 0.5f; // homogeneous midpoint if degenerate
+    if (!isfinite(t)) t = 0.5f;
+    t = fminf(1.f, fmaxf(0.f, t));
 
     // Edge weights (perspective-correct along the edge)
     s0 = 1.0f - t;
@@ -926,7 +993,7 @@ __global__ void backward_opacity_aux_loss_kernel(
     const float* __restrict__ target,        // [B, H, W, C]
     const float* __restrict__ rast,          // [B, H, W, 4]
     int num_frags,
-    const int* __restrict__ frag_pix,        // [num_frags, 3]
+    const int* __restrict__ frag_pix,        // [num_frags, 4]
     const float* __restrict__ frag_attrs,    // [num_frags, 4]
     const float* __restrict__ frag_alpha,    // [num_frags]
     float* __restrict__ grad_frag_alpha      // [num_frags]
@@ -934,12 +1001,15 @@ __global__ void backward_opacity_aux_loss_kernel(
     const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_frags) return;
 
-    const int batch = frag_pix[idx * 3 + 0];
-    const int y = frag_pix[idx * 3 + 1];
-    const int x = frag_pix[idx * 3 + 2];
-    const int pixel = batch * H * W + y * W + x;
+    const int4 pix = reinterpret_cast<const int4*>(frag_pix)[idx];
+    const int batch = pix.x;
+    if ((unsigned)batch >= (unsigned)B) return;
 
-    if (batch < 0) return;
+    const int y = pix.y;
+    const int x = pix.z;
+    if ((unsigned)y >= (unsigned)H || (unsigned)x >= (unsigned)W) return;
+
+    const int pixel = batch * H * W + y * W + x;
 
     const float depth_frag = frag_attrs[idx * 4 + 2];
     const int triangle_frag = static_cast<int>(frag_attrs[idx * 4 + 3]) - 1;
@@ -956,17 +1026,19 @@ __global__ void backward_opacity_aux_loss_kernel(
 
     #pragma unroll 4
     for (int i = 0; i < C; ++i) {
-        loss += abs(color_pixel[i] - target_pixel[i]);
+        loss += fabsf(color_pixel[i] - target_pixel[i]);
     }
 
     constexpr float eps = 1e-5f;
-    const float alpha = frag_alpha[idx];
+    float alpha = frag_alpha[idx];
+    if (!isfinite(alpha)) return;
+    alpha = fminf(1.f - eps, fmaxf(eps, alpha));
 
     if (triangle_pixel >= 0 && triangle_frag == triangle_pixel) {
-        grad_frag_alpha[idx] += loss / MAX(alpha, eps);
+        grad_frag_alpha[idx] += loss / alpha;
     }
     else {
-        grad_frag_alpha[idx] -= loss / MAX(1.f - alpha, eps);
+        grad_frag_alpha[idx] -= loss / (1.f - alpha);
     }
 }
 
@@ -976,7 +1048,7 @@ void backward_opacity_aux_loss(
     const float* __restrict__ target,        // [B, H, W, C]
     const float* __restrict__ rast,          // [B, H, W, 4]
     int num_frags,
-    const int* __restrict__ frag_pix,        // [num_frags, 3]
+    const int* __restrict__ frag_pix,        // [num_frags, 4]
     const float* __restrict__ frag_attrs,    // [num_frags, 4]
     const float* __restrict__ frag_alpha,    // [num_frags]
     float* __restrict__ grad_frag_alpha      // [num_frags]

@@ -53,7 +53,7 @@ NB_MODULE(_core, m)
         nb::ndarray<int32_t,  nb::pytorch, nb::shape<-1, 3>,         nb::c_contig> tri,
         nb::ndarray<int32_t,  nb::pytorch, nb::shape<-1>,            nb::c_contig> frag_prefix_sum,
         nb::ndarray<int32_t,  nb::pytorch, nb::shape<-1, 4>,         nb::c_contig> triangle_rects,
-        nb::ndarray<int32_t,  nb::pytorch, nb::shape<-1, 3>,         nb::c_contig> frag_pix,
+        nb::ndarray<int32_t,  nb::pytorch, nb::shape<-1, 4>,         nb::c_contig> frag_pix,
         nb::ndarray<float,    nb::pytorch, nb::shape<-1, 4>,         nb::c_contig> frag_attrs
     ) {
         const int B = static_cast<int>(pos.shape(0));
@@ -76,7 +76,7 @@ NB_MODULE(_core, m)
     }, "Rasterise triangles into per-pixel fragments with barycentric coordinates.");
 
     m.def("depth_test", [](
-        nb::ndarray<int32_t, nb::pytorch, nb::shape<-1, 3>,  nb::c_contig> frag_pix,
+        nb::ndarray<int32_t, nb::pytorch, nb::shape<-1, 4>,  nb::c_contig> frag_pix,
         nb::ndarray<float,   nb::pytorch, nb::shape<-1, 4>,  nb::c_contig> frag_attrs,
         nb::ndarray<float,   nb::pytorch, nb::shape<-1>,     nb::c_contig> frag_alpha,
         nb::ndarray<float,   nb::pytorch, nb::shape<-1>,     nb::c_contig> alpha_thresh,
@@ -94,15 +94,18 @@ NB_MODULE(_core, m)
     }, "Resolve fragment visibility via z-buffer depth test.");
 
     m.def("filter_valid_fragments", [](
-        nb::ndarray<int32_t,  nb::pytorch, nb::shape<-1, 3>, nb::c_contig> frag_pix,
+        int B,
+        int H,
+        int W,
+        nb::ndarray<int32_t,  nb::pytorch, nb::shape<-1, 4>, nb::c_contig> frag_pix,
         nb::ndarray<float,    nb::pytorch, nb::shape<-1, 4>, nb::c_contig> frag_attrs,
-        nb::ndarray<int32_t,  nb::pytorch, nb::shape<-1, 3>, nb::c_contig> frag_pix_out,
+        nb::ndarray<int32_t,  nb::pytorch, nb::shape<-1, 4>, nb::c_contig> frag_pix_out,
         nb::ndarray<float,    nb::pytorch, nb::shape<-1, 4>, nb::c_contig> frag_attrs_out
     ) -> int {
         const int num_frags = static_cast<int>(frag_pix.shape(0));
 
         return ds::cuda::filter_valid_fragments(
-            num_frags, frag_pix.data(), frag_attrs.data(),
+            B, H, W, num_frags, frag_pix.data(), frag_attrs.data(),
             frag_pix_out.data(), frag_attrs_out.data()
         );
     }, "Compact fragment buffers by removing invalid (off-screen) entries.");
@@ -135,7 +138,7 @@ NB_MODULE(_core, m)
         nb::ndarray<float,    nb::pytorch, nb::shape<-1, -1, -1, -1>, nb::c_contig> color,
         nb::ndarray<float,    nb::pytorch, nb::shape<-1, -1, -1, -1>, nb::c_contig> target,
         nb::ndarray<float,    nb::pytorch, nb::shape<-1, -1, -1, 4>,  nb::c_contig> rast,
-        nb::ndarray<int32_t,  nb::pytorch, nb::shape<-1, 3>,          nb::c_contig> frag_pix,
+        nb::ndarray<int32_t,  nb::pytorch, nb::shape<-1, 4>,          nb::c_contig> frag_pix,
         nb::ndarray<float,    nb::pytorch, nb::shape<-1, 4>,          nb::c_contig> frag_attrs,
         nb::ndarray<float,    nb::pytorch, nb::shape<-1>,             nb::c_contig> frag_alpha,
         nb::ndarray<float,    nb::pytorch, nb::shape<-1>,             nb::c_contig> grad_frag_alpha

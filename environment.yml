@@ -1,6 +1,7 @@
 name: diffsoup
 channels:
   - conda-forge
+  - defaults
   - nvidia
 
 dependencies:
@@ -9,14 +10,16 @@ dependencies:
   - cmake>=3.20
   - ninja
   - nvidia::cuda-toolkit=13.0
-  - numpy
-  - scipy
-  - imageio
-  - matplotlib
-  - tqdm
-  - open3d
+  # Keep the numerical stack on defaults/Intel OpenMP on Windows. PyTorch
+  # wheels ship libiomp5md.dll and can conflict with conda-forge libomp.dll.
+  - defaults::intel-openmp
+  - defaults::numpy
+  - defaults::scipy
+  - defaults::imageio
+  - defaults::matplotlib
+  - defaults::tqdm
   - trimesh
-  - scikit-image
+  - defaults::scikit-image
   - pillow
   - pyqt
   - pyopengl
@@ -30,4 +33,8 @@ dependencies:
       - torchvision
       - pytorch-msssim
       - lpips
+      - open3d
       - glad2>=2.0.0
+
+variables:
+  PYTHONNOUSERSITE: "1"

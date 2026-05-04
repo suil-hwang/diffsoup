@@ -14,13 +14,15 @@ _core = cast(Any, import_module("diffsoup._core"))
 # ---------------------------------------------------------------------------
 
 def _filter_valid_fragments(
+    resolution: Tuple[int, int],
+    batch_size: int,
     frag_pix: torch.Tensor,
     frag_attrs: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compact fragment buffers by removing invalid (off-screen) entries.
 
     Args:
-        frag_pix:   (N, 3) int32 — (batch, h, w) per fragment.
+        frag_pix:   (N, 4) int32 — (batch, h, w, triangle) per fragment.
         frag_attrs: (N, 4) float32 — (bary0, bary1, z, triangle_id+1).
 
     Returns:
@@ -30,8 +32,9 @@ def _filter_valid_fragments(
     frag_pix_out = torch.empty_like(frag_pix)
     frag_attrs_out = torch.empty_like(frag_attrs)
 
+    H, W = resolution
     valid_count = _core.filter_valid_fragments(
-        frag_pix, frag_attrs, frag_pix_out, frag_attrs_out
+        batch_size, H, W, frag_pix, frag_attrs, frag_pix_out, frag_attrs_out
     )
 
     frag_pix_out = frag_pix_out[:valid_count].contiguous()
@@ -52,7 +55,7 @@ def _compute_fragments(
         tri:  Triangle indices ``(T, 3)``, int32 CUDA.
 
     Returns:
-        frag_pix:   (N, 3) int32 — ``(batch, h, w)`` per valid fragment.
+        frag_pix:   (N, 4) int32 — ``(batch, h, w, triangle)`` per valid fragment.
         frag_attrs: (N, 4) float32 — ``(bary0, bary1, z, triangle_id+1)``.
     """
     H, W = resolution
@@ -68,14 +71,14 @@ def _compute_fragments(
     frag_prefix = torch.empty(B * T, dtype=torch.int32, device=device)
     num_frags = _core.compute_triangle_rects(H, W, pos, tri, rects, frag_prefix)
 
-    frag_pix = torch.full((num_frags, 3), -1, dtype=torch.int32, device=device)
+    frag_pix = torch.empty((num_frags, 4), dtype=torch.int32, device=device)
     frag_attrs = torch.empty((num_frags, 4), dtype=torch.float32, device=device)
 
     _core.compute_fragments(
         H, W, pos, tri, frag_prefix, rects, frag_pix, frag_attrs
     )
 
-    return _filter_valid_fragments(frag_pix, frag_attrs)
+    return _filter_valid_fragments(resolution, B, frag_pix, frag_attrs)
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +101,7 @@ def _depth_test(
     Args:
         resolution:   Image resolution ``(H, W)``.
         pos:          Homogeneous vertex positions ``(B, V, 4)``, float32 CUDA.
-        frag_pix:     ``(N, 3)`` int32 — ``(batch, h, w)`` per fragment.
+        frag_pix:     ``(N, 4)`` int32 — ``(batch, h, w, triangle)`` per fragment.
         frag_attrs:   ``(N, 4)`` float32 — ``(bary0, bary1, z, triangle_id+1)``.
         frag_alpha:   ``(N,)`` float32 — per-fragment opacity.
         alpha_thresh: ``(N,)`` float32 — per-fragment stochastic threshold.
@@ -113,7 +116,7 @@ def _depth_test(
     device = pos.device
 
     assert pos.shape == (B, V, 4) and pos.dtype == torch.float32 and pos.is_contiguous()
-    assert frag_pix.shape == (num_frags, 3) and frag_pix.dtype == torch.int32 and frag_pix.is_contiguous()
+    assert frag_pix.shape == (num_frags, 4) and frag_pix.dtype == torch.int32 and frag_pix.is_contiguous()
     assert frag_attrs.shape == (num_frags, 4) and frag_attrs.dtype == torch.float32 and frag_attrs.is_contiguous()
     assert frag_alpha.shape == (num_frags,) and frag_alpha.dtype == torch.float32 and frag_alpha.is_contiguous()
     assert alpha_thresh.shape == (num_frags,) and alpha_thresh.dtype == torch.float32 and alpha_thresh.is_contiguous()
@@ -123,7 +126,7 @@ def _depth_test(
     assert frag_alpha.device == device
     assert alpha_thresh.device == device
 
-    rast = torch.zeros(B, H, W, 4, dtype=torch.float32, device=device)
+    rast = torch.empty(B, H, W, 4, dtype=torch.float32, device=device)
     _core.depth_test(frag_pix, frag_attrs, frag_alpha, alpha_thresh, rast)
     return rast
 

@@ -30,7 +30,7 @@ void compute_fragments(
 void depth_test(
     int B, int H, int W,
     int num_frags,
-    const int* frag_pix,       // [num_frags, 3]
+    const int* frag_pix,       // [num_frags, 4]
     const float* frag_attrs,   // [num_frags, 4]
     const float* frag_alpha,   // [num_frags]
     const float* alpha_thresh, // [num_frags]
@@ -38,10 +38,13 @@ void depth_test(
 );
 
 int filter_valid_fragments(
+    int B,
+    int H,
+    int W,
     int num_frags,
-    const int* frag_pix,         // [num_frags, 3]
+    const int* frag_pix,         // [num_frags, 4]
     const float* frag_attrs,     // [num_frags, 4]
-    int* frag_pix_out,           // [num_frags, 3]
+    int* frag_pix_out,           // [num_frags, 4]
     float* frag_attrs_out        // [num_frags, 4]
 );
 
@@ -62,7 +65,7 @@ void backward_opacity_aux_loss(
     const float* target,                     // [B, H, W, C]
     const float* rast,                       // [B, H, W, 4]
     int num_frags,
-    const int* frag_pix,                     // [num_frags, 3]
+    const int* frag_pix,                     // [num_frags, 4]
     const float* frag_attrs,                 // [num_frags, 4]
     const float* frag_alpha,                 // [num_frags]
     float* grad_frag_alpha                   // [num_frags]
