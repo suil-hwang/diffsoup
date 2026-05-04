@@ -13,9 +13,24 @@ dependencies = [
     "torch>=2.1.0"
 ]
 
+[project.optional-dependencies]
+py-viewer = [
+    "numpy",
+    "pillow",
+    "PyQt5>=5.15",
+    "PyOpenGL>=3.1"
+]
+py-viewer-fast = [
+    "numpy",
+    "pillow",
+    "PyQt5>=5.15",
+    "PyOpenGL>=3.1",
+    "PyOpenGL-accelerate>=3.1"
+]
+
 [tool.scikit-build]
 build.verbose = true
-wheel.packages = ["python/diffsoup"]
+wheel.packages = ["python/diffsoup", "py_viewer"]
 
 [tool.pyrefly]
-search-path = ["python", "examples", "viewer/python"]
+search-path = [".", "python", "examples", "viewer/python"]
