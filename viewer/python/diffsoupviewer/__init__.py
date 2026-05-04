@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import os
-from typing import Sequence
+from importlib import import_module
+from typing import Any, Sequence, cast
 
 import numpy as np
+import numpy.typing as npt
 
-from ._core import __version__
-from . import _core
+_core = cast(Any, import_module(f"{__name__}._core"))
+__version__: str = _core.__version__
 
 
 def launch_viewer(
@@ -106,7 +108,7 @@ def benchmark(
     assert faces.ndim == 2 and faces.shape[1] == 3
     assert mvps.ndim == 3 and mvps.shape[1:] == (4, 4)
 
-    def c(arr: np.ndarray, dtype: np.dtype) -> np.ndarray:
+    def c(arr: np.ndarray, dtype: npt.DTypeLike) -> np.ndarray:
         return np.ascontiguousarray(arr, dtype=dtype)
 
     _core.benchmark_viewer_with_mlp(
@@ -121,10 +123,10 @@ def benchmark(
         c(W3, np.float32),
         c(b3, np.float32),
         c(mvps, np.float32),
-        int(width),
-        int(height),
-        int(warmup),
-        int(save_every),
+        width,
+        height,
+        warmup,
+        save_every,
         output_dir,
         np.array(up, dtype=np.float32),
     )

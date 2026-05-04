@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import os
 import struct
-from typing import Dict, List, Optional, Tuple
+from importlib import import_module
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import numpy as np
 import torch
@@ -64,7 +65,7 @@ def farthest_point_downsample(points: np.ndarray, n: int) -> np.ndarray:
     Returns:
         ``(n, 3)`` float32 subset.
     """
-    import open3d as o3d
+    o3d = cast(Any, import_module("open3d"))
 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points)
@@ -296,7 +297,7 @@ def load_mipnerf360_scene(
     split: str = "train",
     holdout: int = 8,
     downscale: int = 4,
-    device: Optional[torch.device] = None,
+    device: torch.device | str | None = None,
     linearize: bool = False,
 ) -> Dict:
     """Load a MipNeRF-360 COLMAP scene with a 3DGS-compatible train/test split.

@@ -16,3 +16,6 @@ dependencies = [
 [tool.scikit-build]
 build.verbose = true
 wheel.packages = ["python/diffsoup"]
+
+[tool.pyrefly]
+search-path = ["python", "examples", "viewer/python"]

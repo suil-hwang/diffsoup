@@ -1,12 +1,15 @@
 # python/diffsoup/multires.py
 """Multi-resolution triangle features: colour, opacity, and level accumulation."""
 
+from importlib import import_module
+from typing import Any, Tuple, cast
+
 import torch
 from torch import nn
-from typing import Tuple
 
-from . import _core
 from . import rasterize as _rz
+
+_core = cast(Any, import_module("diffsoup._core"))
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +232,8 @@ class _MultiresTriangleColorFn(torch.autograd.Function):
         return out
 
     @staticmethod
-    def backward(ctx, grad_out):
+    def backward(ctx, *grad_outputs):
+        (grad_out,) = grad_outputs
         rast, levels, feat = ctx.saved_tensors
         min_level = levels[0].item()
         max_level = levels[1].item()
@@ -295,7 +299,8 @@ class _AccumulateToLevelFn(torch.autograd.Function):
         return feat_out
 
     @staticmethod
-    def backward(ctx, grad_feat_out):
+    def backward(ctx, *grad_outputs):
+        (grad_feat_out,) = grad_outputs
         levels, feat = ctx.saved_tensors
         min_level = levels[0].item()
         max_level = levels[1].item()

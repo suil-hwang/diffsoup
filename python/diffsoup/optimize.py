@@ -1,6 +1,9 @@
 # python/diffsoup/optimize.py
 """Custom optimisers for triangle-soup parameters."""
 
+from collections.abc import Callable
+from typing import overload
+
 import torch
 
 
@@ -30,8 +33,19 @@ class VectorAdam(torch.optim.Optimizer):
     def __setstate__(self, state):
         super().__setstate__(state)
 
+    @overload
+    def step(self, closure: None = None) -> None: ...
+
+    @overload
+    def step(self, closure: Callable[[], float]) -> float: ...
+
     @torch.no_grad()
-    def step(self):
+    def step(self, closure: Callable[[], float] | None = None) -> float | None:
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
         for group in self.param_groups:
             lr = group["lr"]
             b1, b2 = group["betas"]
@@ -66,3 +80,5 @@ class VectorAdam(torch.optim.Optimizer):
 
                 # Isotropic normalisation
                 p.data.sub_(m1 / (m2.sqrt() + 1e-8), alpha=lr)
+
+        return loss

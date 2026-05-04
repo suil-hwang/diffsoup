@@ -1,10 +1,12 @@
 # python/diffsoup/rasterize.py
 """Software rasterisation, edge-gradient computation, and view-direction encoding."""
 
-import torch
-from typing import Tuple
+from importlib import import_module
+from typing import Any, Tuple, cast
 
-from . import _core
+import torch
+
+_core = cast(Any, import_module("diffsoup._core"))
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +192,8 @@ class _OpacityAuxLossFn(torch.autograd.Function):
         return torch.zeros(1, dtype=torch.float32, device=dev)
 
     @staticmethod
-    def backward(ctx, grad_loss: torch.Tensor):
+    def backward(ctx, *grad_outputs):
+        (grad_loss,) = grad_outputs
         grad_alpha_src, weight = ctx.saved_tensors
         grad_alpha_src = weight.item() * grad_loss * grad_alpha_src
         return None, None, None, None, None, None, grad_alpha_src
@@ -265,7 +268,8 @@ class _EdgeGradFn(torch.autograd.Function):
         return color
 
     @staticmethod
-    def backward(ctx, grad_color):
+    def backward(ctx, *grad_outputs):
+        (grad_color,) = grad_outputs
         color, rast, pos, tri = ctx.saved_tensors
         grad_color = grad_color.contiguous()
         grad_pos = torch.zeros_like(pos)

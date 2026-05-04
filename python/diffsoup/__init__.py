@@ -3,10 +3,14 @@
 
 from __future__ import annotations
 
+from importlib import import_module
+from typing import Any, cast
+
 import torch
-from ._core import __version__
-from . import _core
 from . import optimize
+
+_core = cast(Any, import_module(f"{__name__}._core"))
+__version__: str = _core.__version__
 
 from .rasterize import (
     edge_grad,

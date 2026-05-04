@@ -30,18 +30,17 @@ import math
 import os
 import random
 from dataclasses import dataclass
+from importlib import import_module
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, cast
 
 import imageio.v2 as iio
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from PIL import Image
-from pytorch_msssim import ssim
 from skimage.metrics import structural_similarity as sk_ssim
 from torch.optim import Adam
-from tqdm import tqdm
 
 import diffsoup as ds
 from utils import (
@@ -49,6 +48,9 @@ from utils import (
     exp_decay_mult,
     count_visible_triangles,
 )
+
+ssim = cast(Any, import_module("pytorch_msssim")).ssim
+tqdm = cast(Any, import_module("tqdm")).tqdm
 
 # ── Reproducibility ──────────────────────────────────────────────────
 

@@ -1,9 +1,13 @@
 # python/diffsoup/remesh.py
 """Adaptive triangle-soup subdivision (world-space and clip-space)."""
 
+from importlib import import_module
+from typing import Any, cast
+
 import numpy as np
 import torch
-from . import _core
+
+_core = cast(Any, import_module("diffsoup._core"))
 
 
 def split_triangle_soup(
@@ -38,7 +42,7 @@ def split_triangle_soup(
     f_np = faces.to(torch.int32).detach().cpu().contiguous().numpy()
 
     out_v, out_f, out_map, out_flag = _core.split_triangle_soup(
-        v_np, f_np, int(num_splits), float(tau)
+        v_np, f_np, num_splits, tau
     )
 
     return (
@@ -66,8 +70,8 @@ def split_triangle_soup_until(
     Returns:
         Same four-tuple as :func:`split_triangle_soup`.
     """
-    ns = -1 if hard_cap is None else int(hard_cap)
-    return split_triangle_soup(verts, faces, ns, tau=float(tau))
+    ns = -1 if hard_cap is None else hard_cap
+    return split_triangle_soup(verts, faces, ns, tau=tau)
 
 
 def split_triangle_soup_clip(
@@ -116,14 +120,14 @@ def split_triangle_soup_clip(
     valid_faces = valid_faces.to(torch.int32).contiguous()
     mvp = mvp.float().contiguous()
 
-    aspect_wh = float(W) / float(H)
+    aspect_wh = W / H
     out_v, out_f, out_map, out_flag = _core.split_triangle_soup_clip(
         mvp.detach().cpu().numpy(),
         verts.detach().cpu().numpy(),
         faces.detach().cpu().numpy(),
         valid_faces.detach().cpu().numpy(),
-        int(num_splits),
-        float(tau_ratio),
+        num_splits,
+        tau_ratio,
         aspect_wh,
     )
 
@@ -158,7 +162,7 @@ def split_triangle_soup_clip_until(
     Returns:
         Same four-tuple as :func:`split_triangle_soup`.
     """
-    ns = -1 if hard_cap is None else int(hard_cap)
+    ns = -1 if hard_cap is None else hard_cap
     return split_triangle_soup_clip(
         resolution, mvp, verts, faces, valid_faces, ns, tau_ratio
     )

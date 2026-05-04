@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import numpy as np
 from scipy.spatial import cKDTree
 import torch
@@ -24,7 +26,7 @@ def nn_spacing(points: np.ndarray, reduction: str = "median") -> float:
     if P.shape[0] < 2:
         return 0.0
 
-    tree = cKDTree(P)
+    tree = cast(Any, cKDTree)(P)
     dists, _ = tree.query(P, k=2, p=2)  # [:,0]=self, [:,1]=1-NN
     nn = dists[:, 1]
     nn = nn[np.isfinite(nn)]

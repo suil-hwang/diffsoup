@@ -16,16 +16,14 @@ from __future__ import annotations
 import argparse
 import os
 import random
-from typing import List, Optional
+from importlib import import_module
+from typing import Any, List, Optional, cast
 
 import imageio.v2 as iio
 import matplotlib.pyplot as plt
 import numpy as np
-import open3d as o3d
 import torch
-from pytorch_msssim import ssim
 from torch.optim import Adam
-from tqdm.auto import tqdm
 
 import diffsoup as ds
 from utils import (
@@ -39,6 +37,10 @@ from utils import (
     build_keep_map,
     split_edges_from_training_views,
 )
+
+o3d = cast(Any, import_module("open3d"))
+ssim = cast(Any, import_module("pytorch_msssim")).ssim
+tqdm = cast(Any, import_module("tqdm.auto")).tqdm
 
 # ── Reproducibility ──────────────────────────────────────────────────
 
