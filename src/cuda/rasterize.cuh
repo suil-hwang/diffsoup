@@ -47,25 +47,25 @@ int filter_valid_fragments(
 
 void backward_edge_grad(
     int B, int H, int W, int C,
-    const float* __restrict__ color,         // [B, H, W, C]
-    const float* __restrict__ grad_color,    // [B, H, W, C]
-    const float* __restrict__ rast,          // [B, H, W, 4]
+    const float* color,                      // [B, H, W, C]
+    const float* grad_color,                 // [B, H, W, C]
+    const float* rast,                       // [B, H, W, 4]
     int V,
-    const float* __restrict__ pos,           // [B, V, 4]
-    float* __restrict__ grad_pos,            // [B, V, 4]
-    const int* __restrict__ tri              // [T, 3]
+    const float* pos,                        // [B, V, 4]
+    float* grad_pos,                         // [B, V, 4]
+    const int* tri                           // [T, 3]
 );
 
 void backward_opacity_aux_loss(
     int B, int H, int W, int C,
-    const float* __restrict__ color,         // [B, H, W, C]
-    const float* __restrict__ target,        // [B, H, W, C]
-    const float* __restrict__ rast,          // [B, H, W, 4]
+    const float* color,                      // [B, H, W, C]
+    const float* target,                     // [B, H, W, C]
+    const float* rast,                       // [B, H, W, 4]
     int num_frags,
-    const int* __restrict__ frag_pix,        // [num_frags, 3]
-    const float* __restrict__ frag_attrs,    // [num_frags, 4]
-    const float* __restrict__ frag_alpha,    // [num_frags]
-    float* __restrict__ grad_frag_alpha      // [num_frags]
+    const int* frag_pix,                     // [num_frags, 3]
+    const float* frag_attrs,                 // [num_frags, 4]
+    const float* frag_alpha,                 // [num_frags]
+    float* grad_frag_alpha                   // [num_frags]
 );
 
 } // namespace cuda

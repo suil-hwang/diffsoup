@@ -1,6 +1,6 @@
 #pragma once
 
-#include <cstdint>
+#include <stdint.h>
 
 namespace diffsoup {
 
@@ -24,25 +24,25 @@ namespace cuda {
 
 void multires_triangle_alpha(
     int num_frags,
-    const float* __restrict__ frag_attrs,   // [num_frags, 4]
+    const float* frag_attrs,                // [num_frags, 4]
     const uint32_t min_level,
     const uint32_t max_level,
     const float* alpha_src,                 // [T, S], where T is triangle count and S = Σ (2^(level - 1) + 1) * (2^level + 1)
-    float* __restrict__ frag_alpha          // [num_frags]
+    float* frag_alpha                       // [num_frags]
 );
 
 void backward_multires_triangle_alpha(
     int num_frags,
-    const float* __restrict__ frag_attrs,      // [num_frags, 4]
+    const float* frag_attrs,                   // [num_frags, 4]
     const uint32_t min_level,
     const uint32_t max_level,
     float* grad_alpha_src,                      // [T, S], where T is triangle count and S = Σ (2^(level - 1) + 1) * (2^level + 1)
-    const float* __restrict__ grad_frag_alpha   // [num_frags]
+    const float* grad_frag_alpha                // [num_frags]
 );
 
 void multires_triangle_color(
     int B, int H, int W,
-    const float* __restrict__ rast,          // [B, H, W, 4]
+    const float* rast,                       // [B, H, W, 4]
     const uint32_t min_level,
     const uint32_t max_level,
     const uint32_t feature_dim,
@@ -52,12 +52,12 @@ void multires_triangle_color(
 
 void backward_multires_triangle_color(
     int B, int H, int W,
-    const float* __restrict__ rast,
+    const float* rast,
     const uint32_t min_level,
     const uint32_t max_level,
     const uint32_t feature_dim,
     float* grad_features,                // [T, S, feature_dim], where T is triangle count and S = Σ (2^(level - 1) + 1) * (2^level + 1)
-    const float* __restrict__ grad_out   // [B, H, W, feature_dim]
+    const float* grad_out                // [B, H, W, feature_dim]
 );
 
 void accumulate_to_level_forward(
@@ -66,8 +66,8 @@ void accumulate_to_level_forward(
     const uint32_t max_level,                // original “max” used for layout/stride
     const uint32_t target_level,             // ≤ max_level
     const uint32_t feature_dim,
-    const float* __restrict__ features,      // [T, Σ_{l=min..concat} S_l, C]
-    float* __restrict__ f_target             // [T, feats_at_level(target_level), C]
+    const float* features,                   // [T, Σ_{l=min..concat} S_l, C]
+    float* f_target                          // [T, feats_at_level(target_level), C]
 );
 
 void accumulate_to_level_backward(
@@ -76,8 +76,8 @@ void accumulate_to_level_backward(
     const uint32_t max_level,                // original “max” used for layout/stride
     const uint32_t target_level,             // ≤ max_level
     const uint32_t feature_dim,
-    float* __restrict__ grad_features,       // [T, Σ_{l=min..concat} S_l, C]  (zero before call)
-    const float* __restrict__ grad_f_target  // [T, feats_at_level(target_level), C]
+    float* grad_features,                    // [T, Σ_{l=min..concat} S_l, C]  (zero before call)
+    const float* grad_f_target               // [T, feats_at_level(target_level), C]
 );
 
 } // namespace cuda

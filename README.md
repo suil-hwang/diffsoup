@@ -1,5 +1,6 @@
 # DiffSoup [CVPR 2026]
-Official code release for the paper *DiffSoup: Direct Differentiable Rasterization of Triangle Soup for Extreme Radiance Field Simplification*
+
+Official code release for the paper _DiffSoup: Direct Differentiable Rasterization of Triangle Soup for Extreme Radiance Field Simplification_
 
 <img src="pics/teaser.jpg" alt="Teaser" width="60%">
 
@@ -22,31 +23,27 @@ Recent advances in radiance field reconstruction, such as 3D Gaussian splatting,
 
 ## Installation
 
-Clone this repository and create a virtual environment:
+Clone this repository and create the Conda environment:
 
 ```bash
 git clone https://github.com/kenji-tojo/diffsoup.git
 cd diffsoup
-python3 -m venv venv
-source venv/bin/activate
+conda env create -f environment.yml
+conda activate diffsoup
 ```
 
-Install PyTorch with CUDA 12.4 from the [official website](https://pytorch.org/get-started/locally/):
-
-```bash
-pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-```
+The environment file installs PyTorch with CUDA 13.0, the runtime Python dependencies, and the build dependencies required by `pyproject.toml`.
 
 Build and install the `diffsoup` module:
 
 ```bash
-pip3 install -v .
+pip install -v .
 ```
 
-Install the remaining dependencies:
+The native OpenGL viewer is packaged separately and can be installed when needed:
 
 ```bash
-pip3 install -r requirements.txt
+pip install -v viewer/
 ```
 
 ## Datasets
@@ -55,10 +52,10 @@ pip3 install -r requirements.txt
 
 Download the following datasets from their official websites and extract them under `./datasets/`:
 
-| Dataset | Directory |
-|---|---|
-| [MipNeRF-360](https://jonbarron.info/mipnerf360/) | `datasets/360_v2/` |
-| [NeRF-Synthetic](https://www.matthewtancik.com/nerf) | `datasets/nerf_synthetic/` |
+| Dataset                                                                | Directory                       |
+| ---------------------------------------------------------------------- | ------------------------------- |
+| [MipNeRF-360](https://jonbarron.info/mipnerf360/)                      | `datasets/360_v2/`              |
+| [NeRF-Synthetic](https://www.matthewtancik.com/nerf)                   | `datasets/nerf_synthetic/`      |
 | [Shelly](https://research.nvidia.com/labs/toronto-ai/adaptive-shells/) | `datasets/shelly_data_release/` |
 
 ### MobileNeRF Meshes (for Initialization)
@@ -99,7 +96,7 @@ Each script saves a checkpoint (`final_params.pt`), rendered images, and test me
 View a trained checkpoint with the native OpenGL viewer. The viewer has no CUDA dependency and can be installed on any machine (e.g. a laptop) with OpenGL support:
 
 ```bash
-pip3 install -v viewer/
+pip install -v viewer/
 
 python3 examples/04_view_results.py --ckpt results/01_mip360/kitchen/final_params.pt
 ```

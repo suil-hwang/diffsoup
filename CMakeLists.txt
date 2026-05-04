@@ -52,6 +52,13 @@ set_target_properties(_core PROPERTIES
     CXX_EXTENSIONS NO
 )
 
+if(MSVC)
+    target_compile_options(_core PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>
+    )
+endif()
+
 target_include_directories(_core PRIVATE
     src
     ${CUDAToolkit_INCLUDE_DIRS}

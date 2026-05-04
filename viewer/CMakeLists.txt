@@ -55,6 +55,9 @@ endif()
 
 add_library(glad_gl STATIC "${GLAD_OUT}/src/gl.c")
 target_include_directories(glad_gl PUBLIC "${GLAD_OUT}/include")
+if(MSVC)
+    target_compile_options(glad_gl PRIVATE /utf-8)
+endif()
 
 # ==================================================================
 # 4. Dear ImGui — immediate-mode GUI
@@ -66,6 +69,9 @@ FetchContent_Declare(imgui
 
 # Populate all dependencies.
 FetchContent_MakeAvailable(glfw glm)
+if(MSVC AND TARGET glfw)
+    target_compile_options(glfw PRIVATE /utf-8)
+endif()
 
 FetchContent_GetProperties(imgui)
 if(NOT imgui_POPULATED)
@@ -86,6 +92,9 @@ target_include_directories(imgui_lib PUBLIC
     ${imgui_SOURCE_DIR}/backends)
 
 target_link_libraries(imgui_lib PUBLIC glfw glad_gl)
+if(MSVC)
+    target_compile_options(imgui_lib PRIVATE /utf-8)
+endif()
 
 # ==================================================================
 # nanobind
@@ -117,6 +126,10 @@ target_link_libraries(_core PRIVATE
     glad_gl
     glm::glm
     imgui_lib)
+
+if(MSVC)
+    target_compile_options(_core PRIVATE /utf-8)
+endif()
 
 if(APPLE)
     target_link_libraries(_core PRIVATE
