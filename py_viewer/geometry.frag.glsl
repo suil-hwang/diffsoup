@@ -1,14 +1,17 @@
 #version 410 core
 flat in uint vTriID;
+flat in vec3 vNormal;
 in vec3 vBary;
 
 layout(location=0) out vec4 FragA;
 layout(location=1) out vec4 FragB;
+layout(location=2) out vec4 FragNormal;
 
 uniform ivec2 uTriTexSize;
 uniform sampler2D uTriTex0;
 uniform sampler2D uTriTex1;
 uniform int uLevel;
+uniform bool uFaceForwardNormals;
 
 ivec2 idx_to_coord(int idx, int texW) {
     return ivec2(idx % texW, idx / texW);
@@ -26,6 +29,7 @@ void main() {
     int texH = uTriTexSize.y;
     if (texW * texH <= 0) {
         FragA = FragB = vec4(1, 0, 1, 1);
+        FragNormal = vec4(0.5, 0.5, 1.0, 1.0);
         return;
     }
 
@@ -74,4 +78,7 @@ void main() {
     if (b.a < 0.5) discard;
     FragA = a;
     FragB = vec4(b.rgb, 1.0);
+    vec3 normal = normalize(vNormal);
+    if (uFaceForwardNormals && !gl_FrontFacing) normal = -normal;
+    FragNormal = vec4(normal * 0.5 + 0.5, 1.0);
 }

@@ -1,4 +1,4 @@
-"""Checkpoint parsing and render-data validation for the Python viewer."""
+# py_viewer/scene.py
 
 from __future__ import annotations
 
@@ -204,7 +204,7 @@ def load_checkpoint_scene(
     if not checkpoint_path.is_file():
         raise FileNotFoundError(checkpoint_path)
     checkpoint = torch.load(
-        checkpoint_path, map_location="cpu", weights_only=False
+        checkpoint_path, map_location="cpu", weights_only=True
     )
     required = {"V", "F", "feat_acc", "alpha_acc", "color_mlp", "Rmax"}
     missing = sorted(required.difference(checkpoint))

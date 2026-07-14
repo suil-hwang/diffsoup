@@ -4,7 +4,14 @@ out vec4 FragColor;
 
 uniform sampler2D texA;
 uniform sampler2D texB;
+uniform sampler2D texNormal;
+uniform sampler2D texDepth;
 uniform mat4 uInvMVP;
+uniform int uRenderMode;
+uniform float uNearClip;
+uniform float uFarClip;
+uniform float uDepthDisplayNear;
+uniform float uDepthDisplayFar;
 
 uniform mat4 W1[16];
 uniform vec4 B1[4];
@@ -15,6 +22,17 @@ uniform vec4 B3;
 
 vec4 relu4(vec4 x) { return max(x, 0.0); }
 float sigmoid(float x) { return 1.0 / (1.0 + exp(-x)); }
+
+const int RENDER_COLOR = 0;
+const int RENDER_DEPTH = 1;
+const int RENDER_NORMAL = 2;
+
+float linearize_depth(float window_depth) {
+    float ndc_depth = window_depth * 2.0 - 1.0;
+    float denominator = uFarClip + uNearClip
+                      - ndc_depth * (uFarClip - uNearClip);
+    return (2.0 * uNearClip * uFarClip) / max(denominator, 1e-20);
+}
 
 vec3 ndc_to_world(vec4 ndc) {
     vec4 clip = uInvMVP * ndc;
@@ -49,6 +67,21 @@ void main() {
     vec4 B = texture(texB, vUV);
     if (B.a < 0.5) {
         FragColor = vec4(A.rgb, 1.0);
+        return;
+    }
+
+    if (uRenderMode == RENDER_DEPTH) {
+        float linear_depth = linearize_depth(texture(texDepth, vUV).r);
+        float depth_range = max(uDepthDisplayFar - uDepthDisplayNear, 1e-20);
+        float normalized_depth = clamp(
+            (linear_depth - uDepthDisplayNear) / depth_range, 0.0, 1.0
+        );
+        FragColor = vec4(vec3(normalized_depth), 1.0);
+        return;
+    }
+
+    if (uRenderMode == RENDER_NORMAL) {
+        FragColor = vec4(texture(texNormal, vUV).rgb, 1.0);
         return;
     }
 

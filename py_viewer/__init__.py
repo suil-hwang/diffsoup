@@ -1,10 +1,20 @@
-"""Pure-Python OpenGL viewer for DiffSoup checkpoints."""
+# py_viewer/__init__.py
 
 from .scene import SceneData, load_checkpoint_scene
-from .viewer import benchmark, launch_scene, launch_viewer
+from .viewer import (
+    DepthRange,
+    NormalOrientation,
+    RenderMode,
+    benchmark,
+    launch_scene,
+    launch_viewer,
+)
 
 __all__ = [
     "SceneData",
+    "DepthRange",
+    "NormalOrientation",
+    "RenderMode",
     "benchmark",
     "launch_scene",
     "launch_viewer",
@@ -12,4 +22,3 @@ __all__ = [
 ]
 
 __version__ = "0.1.0"
-

@@ -1,4 +1,4 @@
-"""NumPy orbit camera matching the native GLFW/GLM viewer controls."""
+# py_viewer/camera.py
 
 from __future__ import annotations
 
