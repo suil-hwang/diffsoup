@@ -21,6 +21,43 @@ using namespace nb::literals;
 
 namespace ds = diffsoup;
 
+namespace {
+cudaStream_t stream_from_handle(uintptr_t handle)
+{
+    return reinterpret_cast<cudaStream_t>(handle);
+}
+
+class CudaDeviceGuard {
+public:
+    explicit CudaDeviceGuard(int device)
+    {
+        check(cudaGetDevice(&previous_));
+        if (previous_ != device) {
+            check(cudaSetDevice(device));
+            restore_ = true;
+        }
+    }
+
+    ~CudaDeviceGuard()
+    {
+        if (restore_) {
+            cudaSetDevice(previous_);
+        }
+    }
+
+private:
+    static void check(cudaError_t error)
+    {
+        if (error != cudaSuccess) {
+            throw std::runtime_error(cudaGetErrorString(error));
+        }
+    }
+
+    int previous_ = 0;
+    bool restore_ = false;
+};
+} // namespace
+
 NB_MODULE(_core, m)
 {
     m.attr("__version__") = "0.1.0";
@@ -32,8 +69,10 @@ NB_MODULE(_core, m)
         nb::ndarray<float,    nb::pytorch, nb::shape<-1, -1, 4>, nb::c_contig> pos,
         nb::ndarray<int32_t,  nb::pytorch, nb::shape<-1, 3>,     nb::c_contig> tri,
         nb::ndarray<int32_t,  nb::pytorch, nb::shape<-1, 4>,     nb::c_contig> triangle_rects,
-        nb::ndarray<int32_t,  nb::pytorch, nb::shape<-1>,        nb::c_contig> frag_prefix_sum
+        nb::ndarray<int32_t,  nb::pytorch, nb::shape<-1>,        nb::c_contig> frag_prefix_sum,
+        uintptr_t stream_handle
     ) -> int {
+        CudaDeviceGuard device_guard(pos.device_id());
         const int B = static_cast<int>(pos.shape(0));
         const int V = static_cast<int>(pos.shape(1));
         const int T = static_cast<int>(tri.shape(0));
@@ -43,7 +82,8 @@ NB_MODULE(_core, m)
             V, pos.data(),
             T, tri.data(),
             triangle_rects.data(),
-            frag_prefix_sum.data()
+            frag_prefix_sum.data(),
+            stream_from_handle(stream_handle)
         );
     }, "Compute screen-space bounding rectangles and fragment prefix sums for each triangle.");
 
@@ -54,7 +94,8 @@ NB_MODULE(_core, m)
         nb::ndarray<int32_t,  nb::pytorch, nb::shape<-1>,            nb::c_contig> frag_prefix_sum,
         nb::ndarray<int32_t,  nb::pytorch, nb::shape<-1, 4>,         nb::c_contig> triangle_rects,
         nb::ndarray<int32_t,  nb::pytorch, nb::shape<-1, 3>,         nb::c_contig> frag_pix,
-        nb::ndarray<float,    nb::pytorch, nb::shape<-1, 4>,         nb::c_contig> frag_attrs
+        nb::ndarray<float,    nb::pytorch, nb::shape<-1, 4>,         nb::c_contig> frag_attrs,
+        uintptr_t stream_handle
     ) {
         const int B = static_cast<int>(pos.shape(0));
         const int V = static_cast<int>(pos.shape(1));
@@ -62,6 +103,7 @@ NB_MODULE(_core, m)
         const int num_tris = B * T;
         const int num_frags = static_cast<int>(frag_pix.shape(0));
 
+        CudaDeviceGuard device_guard(pos.device_id());
         ds::cuda::compute_fragments(
             H, W,
             V, pos.data(),
@@ -71,7 +113,8 @@ NB_MODULE(_core, m)
             frag_prefix_sum.data(),
             triangle_rects.data(),
             frag_pix.data(),
-            frag_attrs.data()
+            frag_attrs.data(),
+            stream_from_handle(stream_handle)
         );
     }, "Rasterise triangles into per-pixel fragments with barycentric coordinates.");
 
@@ -80,32 +123,54 @@ NB_MODULE(_core, m)
         nb::ndarray<float,   nb::pytorch, nb::shape<-1, 4>,  nb::c_contig> frag_attrs,
         nb::ndarray<float,   nb::pytorch, nb::shape<-1>,     nb::c_contig> frag_alpha,
         nb::ndarray<float,   nb::pytorch, nb::shape<-1>,     nb::c_contig> alpha_thresh,
-        nb::ndarray<float,   nb::pytorch, nb::shape<-1, -1, -1, 4>,  nb::c_contig> rast_out
+        nb::ndarray<int64_t, nb::pytorch, nb::shape<-1, -1, -1>,     nb::c_contig> frag_index,
+        nb::ndarray<float,   nb::pytorch, nb::shape<-1, -1, -1, 4>,  nb::c_contig> rast_out,
+        uintptr_t stream_handle
     ) {
         const int num_frags = static_cast<int>(frag_pix.shape(0));
         const int B = static_cast<int>(rast_out.shape(0));
         const int H = static_cast<int>(rast_out.shape(1));
         const int W = static_cast<int>(rast_out.shape(2));
 
+        CudaDeviceGuard device_guard(rast_out.device_id());
         ds::cuda::depth_test(
             B, H, W, num_frags, frag_pix.data(), frag_attrs.data(),
-            frag_alpha.data(), alpha_thresh.data(), rast_out.data()
+            frag_alpha.data(), alpha_thresh.data(),
+            reinterpret_cast<long long*>(frag_index.data()), rast_out.data(),
+            stream_from_handle(stream_handle)
         );
     }, "Resolve fragment visibility via z-buffer depth test.");
 
-    m.def("filter_valid_fragments", [](
+    m.def("count_valid_fragments", [](
+        nb::ndarray<int32_t, nb::pytorch, nb::shape<-1, 3>, nb::c_contig> frag_pix,
+        nb::ndarray<int32_t, nb::pytorch, nb::shape<1>,     nb::c_contig> counter,
+        uintptr_t stream_handle
+    ) -> int {
+        const int num_frags = static_cast<int>(frag_pix.shape(0));
+        CudaDeviceGuard device_guard(frag_pix.device_id());
+        return ds::cuda::count_valid_fragments(
+            num_frags, frag_pix.data(), counter.data(),
+            stream_from_handle(stream_handle)
+        );
+    }, "Count valid fragments before exact-size compaction.");
+
+    m.def("compact_valid_fragments", [](
         nb::ndarray<int32_t,  nb::pytorch, nb::shape<-1, 3>, nb::c_contig> frag_pix,
         nb::ndarray<float,    nb::pytorch, nb::shape<-1, 4>, nb::c_contig> frag_attrs,
         nb::ndarray<int32_t,  nb::pytorch, nb::shape<-1, 3>, nb::c_contig> frag_pix_out,
-        nb::ndarray<float,    nb::pytorch, nb::shape<-1, 4>, nb::c_contig> frag_attrs_out
-    ) -> int {
+        nb::ndarray<float,    nb::pytorch, nb::shape<-1, 4>, nb::c_contig> frag_attrs_out,
+        nb::ndarray<int32_t,  nb::pytorch, nb::shape<1>,     nb::c_contig> counter,
+        uintptr_t stream_handle
+    ) {
         const int num_frags = static_cast<int>(frag_pix.shape(0));
 
-        return ds::cuda::filter_valid_fragments(
+        CudaDeviceGuard device_guard(frag_pix.device_id());
+        ds::cuda::compact_valid_fragments(
             num_frags, frag_pix.data(), frag_attrs.data(),
-            frag_pix_out.data(), frag_attrs_out.data()
+            frag_pix_out.data(), frag_attrs_out.data(), counter.data(),
+            stream_from_handle(stream_handle)
         );
-    }, "Compact fragment buffers by removing invalid (off-screen) entries.");
+    }, "Compact valid fragments into caller-provided exact-size buffers.");
 
     // ── Edge gradients ──────────────────────────────────────────────
 
@@ -115,7 +180,8 @@ NB_MODULE(_core, m)
         nb::ndarray<float,    nb::pytorch, nb::shape<-1, -1, -1, 4>,  nb::c_contig> rast,
         nb::ndarray<float,    nb::pytorch, nb::shape<-1, -1, 4>, nb::c_contig> pos,
         nb::ndarray<float,    nb::pytorch, nb::shape<-1, -1, 4>, nb::c_contig> grad_pos,
-        nb::ndarray<int32_t,  nb::pytorch, nb::shape<-1, 3>, nb::c_contig> tri
+        nb::ndarray<int32_t,  nb::pytorch, nb::shape<-1, 3>, nb::c_contig> tri,
+        uintptr_t stream_handle
     ) {
         const int B = static_cast<int>(color.shape(0));
         const int H = static_cast<int>(color.shape(1));
@@ -123,9 +189,11 @@ NB_MODULE(_core, m)
         const int C = static_cast<int>(color.shape(3));
         const int V = static_cast<int>(pos.shape(1));
 
+        CudaDeviceGuard device_guard(color.device_id());
         return ds::cuda::backward_edge_grad(
             B, H, W, C, color.data(), grad_color.data(), rast.data(),
-            V, pos.data(), grad_pos.data(), tri.data()
+            V, pos.data(), grad_pos.data(), tri.data(),
+            stream_from_handle(stream_handle)
         );
     }, "Backward pass for silhouette / edge gradients into vertex positions.");
 
@@ -138,7 +206,8 @@ NB_MODULE(_core, m)
         nb::ndarray<int32_t,  nb::pytorch, nb::shape<-1, 3>,          nb::c_contig> frag_pix,
         nb::ndarray<float,    nb::pytorch, nb::shape<-1, 4>,          nb::c_contig> frag_attrs,
         nb::ndarray<float,    nb::pytorch, nb::shape<-1>,             nb::c_contig> frag_alpha,
-        nb::ndarray<float,    nb::pytorch, nb::shape<-1>,             nb::c_contig> grad_frag_alpha
+        nb::ndarray<float,    nb::pytorch, nb::shape<-1>,             nb::c_contig> grad_frag_alpha,
+        uintptr_t stream_handle
     ) {
         const int B = static_cast<int>(color.shape(0));
         const int H = static_cast<int>(color.shape(1));
@@ -146,10 +215,12 @@ NB_MODULE(_core, m)
         const int C = static_cast<int>(color.shape(3));
         const int num_frags = static_cast<int>(frag_pix.shape(0));
 
+        CudaDeviceGuard device_guard(color.device_id());
         return ds::cuda::backward_opacity_aux_loss(
             B, H, W, C, color.data(), target.data(), rast.data(),
             num_frags, frag_pix.data(), frag_attrs.data(),
-            frag_alpha.data(), grad_frag_alpha.data()
+            frag_alpha.data(), grad_frag_alpha.data(),
+            stream_from_handle(stream_handle)
         );
     }, "Analytic gradient of the stochastic opacity masking auxiliary objective.");
 
@@ -158,14 +229,17 @@ NB_MODULE(_core, m)
     m.def("encode_view_dir_sh2", [](
         nb::ndarray<float, nb::pytorch, nb::shape<-1, -1, -1, 4>, nb::c_contig> rast,
         nb::ndarray<float, nb::pytorch, nb::shape<-1, 4, 4>,      nb::c_contig> inv_mvp,
-        nb::ndarray<float, nb::pytorch, nb::shape<-1, -1, -1, 9>, nb::c_contig> encoding
+        nb::ndarray<float, nb::pytorch, nb::shape<-1, -1, -1, 9>, nb::c_contig> encoding,
+        uintptr_t stream_handle
     ) {
         const int B = static_cast<int>(rast.shape(0));
         const int H = static_cast<int>(rast.shape(1));
         const int W = static_cast<int>(rast.shape(2));
 
+        CudaDeviceGuard device_guard(rast.device_id());
         ds::cuda::encode_view_dir_sh2(
-            B, H, W, rast.data(), inv_mvp.data(), encoding.data()
+            B, H, W, rast.data(), inv_mvp.data(), encoding.data(),
+            stream_from_handle(stream_handle)
         );
     }, "Evaluate order-2 spherical-harmonic basis on per-pixel view directions.");
 
@@ -175,7 +249,8 @@ NB_MODULE(_core, m)
         nb::ndarray<float, nb::pytorch, nb::shape<-1, 4>,  nb::c_contig> frag_attrs,
         int min_level, int max_level,
         nb::ndarray<float, nb::pytorch, nb::shape<-1, -1>, nb::c_contig> alpha_src,
-        nb::ndarray<float, nb::pytorch, nb::shape<-1>,     nb::c_contig> frag_alpha
+        nb::ndarray<float, nb::pytorch, nb::shape<-1>,     nb::c_contig> frag_alpha,
+        uintptr_t stream_handle
     ) {
         const int num_frags = static_cast<int>(frag_attrs.shape(0));
 
@@ -184,9 +259,11 @@ NB_MODULE(_core, m)
             throw std::runtime_error("Invalid feature size.");
         }
 
+        CudaDeviceGuard device_guard(frag_attrs.device_id());
         ds::cuda::multires_triangle_alpha(
             num_frags, frag_attrs.data(), min_level, max_level,
-            alpha_src.data(), frag_alpha.data()
+            alpha_src.data(), frag_alpha.data(),
+            stream_from_handle(stream_handle)
         );
     }, "Interpolate per-fragment opacity from multi-resolution triangle features.");
 
@@ -194,7 +271,8 @@ NB_MODULE(_core, m)
         nb::ndarray<float, nb::pytorch, nb::shape<-1, 4>,  nb::c_contig> frag_attrs,
         int min_level, int max_level,
         nb::ndarray<float, nb::pytorch, nb::shape<-1, -1>, nb::c_contig> grad_alpha_src,
-        nb::ndarray<float, nb::pytorch, nb::shape<-1>,     nb::c_contig> grad_frag_alpha
+        nb::ndarray<float, nb::pytorch, nb::shape<-1>,     nb::c_contig> grad_frag_alpha,
+        uintptr_t stream_handle
     ) {
         const int num_frags = static_cast<int>(frag_attrs.shape(0));
 
@@ -203,9 +281,11 @@ NB_MODULE(_core, m)
             throw std::runtime_error("Invalid feature size.");
         }
 
+        CudaDeviceGuard device_guard(frag_attrs.device_id());
         ds::cuda::backward_multires_triangle_alpha(
             num_frags, frag_attrs.data(), min_level, max_level,
-            grad_alpha_src.data(), grad_frag_alpha.data()
+            grad_alpha_src.data(), grad_frag_alpha.data(),
+            stream_from_handle(stream_handle)
         );
     }, "Backward pass for multires_triangle_alpha.");
 
@@ -213,7 +293,8 @@ NB_MODULE(_core, m)
         nb::ndarray<float, nb::pytorch, nb::shape<-1, -1, -1, 4>,  nb::c_contig> rast,
         int min_level, int max_level,
         nb::ndarray<float, nb::pytorch, nb::shape<-1, -1, -1>,     nb::c_contig> features,
-        nb::ndarray<float, nb::pytorch, nb::shape<-1, -1, -1, -1>, nb::c_contig> out
+        nb::ndarray<float, nb::pytorch, nb::shape<-1, -1, -1, -1>, nb::c_contig> out,
+        uintptr_t stream_handle
     ) {
         const int B = static_cast<int>(rast.shape(0));
         const int H = static_cast<int>(rast.shape(1));
@@ -225,9 +306,10 @@ NB_MODULE(_core, m)
             throw std::runtime_error("Invalid feature size.");
         }
 
+        CudaDeviceGuard device_guard(rast.device_id());
         ds::cuda::multires_triangle_color(
             B, H, W, rast.data(), min_level, max_level, feature_dim,
-            features.data(), out.data()
+            features.data(), out.data(), stream_from_handle(stream_handle)
         );
     }, "Interpolate per-pixel colour from multi-resolution triangle features.");
 
@@ -235,7 +317,8 @@ NB_MODULE(_core, m)
         nb::ndarray<float, nb::pytorch, nb::shape<-1, -1, -1, 4>,  nb::c_contig> rast,
         int min_level, int max_level,
         nb::ndarray<float, nb::pytorch, nb::shape<-1, -1, -1>,     nb::c_contig> grad_features,
-        nb::ndarray<float, nb::pytorch, nb::shape<-1, -1, -1, -1>, nb::c_contig> grad_out
+        nb::ndarray<float, nb::pytorch, nb::shape<-1, -1, -1, -1>, nb::c_contig> grad_out,
+        uintptr_t stream_handle
     ) {
         const int B = static_cast<int>(rast.shape(0));
         const int H = static_cast<int>(rast.shape(1));
@@ -247,18 +330,43 @@ NB_MODULE(_core, m)
             throw std::runtime_error("Invalid feature size.");
         }
 
+        CudaDeviceGuard device_guard(rast.device_id());
         ds::cuda::backward_multires_triangle_color(
             B, H, W, rast.data(), min_level, max_level, feature_dim,
-            grad_features.data(), grad_out.data()
+            grad_features.data(), grad_out.data(),
+            stream_from_handle(stream_handle)
         );
     }, "Backward pass for multires_triangle_color.");
 
     // ── Cross-level accumulation ────────────────────────────────────
 
+    m.def("build_accumulation_plan", [](
+        int min_level, int max_level, int target_level,
+        nb::ndarray<int32_t, nb::pytorch, nb::shape<-1, -1, 3>, nb::c_contig> plan_indices,
+        nb::ndarray<float,   nb::pytorch, nb::shape<-1, -1, 3>, nb::c_contig> plan_weights,
+        uintptr_t stream_handle
+    ) {
+        const uint32_t S_L = ds::feats_at_level(target_level);
+        const uint32_t num_levels = max_level - min_level + 1;
+        if (plan_indices.shape(0) != S_L || plan_indices.shape(1) != num_levels ||
+            plan_weights.shape(0) != S_L || plan_weights.shape(1) != num_levels) {
+            throw std::runtime_error("Invalid accumulation plan size.");
+        }
+        CudaDeviceGuard device_guard(plan_indices.device_id());
+        ds::cuda::build_accumulation_plan(
+            min_level, max_level, target_level,
+            plan_indices.data(), plan_weights.data(),
+            stream_from_handle(stream_handle)
+        );
+    }, "Build the sparse interpolation plan shared by accumulation forward and backward.");
+
     m.def("accumulate_to_level_forward", [](
         int min_level, int max_level, int target_level,
         nb::ndarray<float, nb::pytorch, nb::shape<-1, -1, -1>, nb::c_contig> feat_all,
-        nb::ndarray<float, nb::pytorch, nb::shape<-1, -1, -1>, nb::c_contig> feat_max
+        nb::ndarray<int32_t, nb::pytorch, nb::shape<-1, -1, 3>, nb::c_contig> plan_indices,
+        nb::ndarray<float,   nb::pytorch, nb::shape<-1, -1, 3>, nb::c_contig> plan_weights,
+        nb::ndarray<float, nb::pytorch, nb::shape<-1, -1, -1>, nb::c_contig> feat_max,
+        uintptr_t stream_handle
     ) {
         const int T = static_cast<int>(feat_all.shape(0));
         const int feat_dim = static_cast<int>(feat_all.shape(2));
@@ -273,16 +381,21 @@ NB_MODULE(_core, m)
             throw std::runtime_error("Invalid feature size.");
         }
 
+        CudaDeviceGuard device_guard(feat_all.device_id());
         ds::cuda::accumulate_to_level_forward(
             T, min_level, max_level, target_level, feat_dim,
-            feat_all.data(), feat_max.data()
+            feat_all.data(), plan_indices.data(), plan_weights.data(),
+            feat_max.data(), stream_from_handle(stream_handle)
         );
     }, "Accumulate multi-resolution features down to a single target level (forward).");
 
     m.def("accumulate_to_level_backward", [](
         int min_level, int max_level, int target_level,
         nb::ndarray<float, nb::pytorch, nb::shape<-1, -1, -1>, nb::c_contig> grad_feat_all,
-        nb::ndarray<float, nb::pytorch, nb::shape<-1, -1, -1>, nb::c_contig> grad_feat_max
+        nb::ndarray<float, nb::pytorch, nb::shape<-1, -1, -1>, nb::c_contig> grad_feat_max,
+        nb::ndarray<int32_t, nb::pytorch, nb::shape<-1, -1, 3>, nb::c_contig> plan_indices,
+        nb::ndarray<float,   nb::pytorch, nb::shape<-1, -1, 3>, nb::c_contig> plan_weights,
+        uintptr_t stream_handle
     ) {
         const int T = static_cast<int>(grad_feat_all.shape(0));
         const int feat_dim = static_cast<int>(grad_feat_all.shape(2));
@@ -297,9 +410,12 @@ NB_MODULE(_core, m)
             throw std::runtime_error("Invalid feature size.");
         }
 
+        CudaDeviceGuard device_guard(grad_feat_all.device_id());
         ds::cuda::accumulate_to_level_backward(
             T, min_level, max_level, target_level, feat_dim,
-            grad_feat_all.data(), grad_feat_max.data()
+            grad_feat_all.data(), grad_feat_max.data(),
+            plan_indices.data(), plan_weights.data(),
+            stream_from_handle(stream_handle)
         );
     }, "Backward pass for accumulate_to_level.");
 

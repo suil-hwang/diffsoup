@@ -17,6 +17,7 @@ from .rasterize import (
 
 from .multires import (
     ColorMLP,
+    RasterizationFragments,
     feats_at_level,
     build_multires_triangle_color,
     rasterize_multires_triangle_alpha,

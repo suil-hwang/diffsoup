@@ -3,10 +3,18 @@
 
 import torch
 from torch import nn
-from typing import Tuple
+from typing import NamedTuple, Tuple
 
 from . import _core
 from . import rasterize as _rz
+
+
+class RasterizationFragments(NamedTuple):
+    """Intermediate fragment data reusable by the opacity auxiliary loss."""
+
+    frag_pix: torch.Tensor
+    frag_attrs: torch.Tensor
+    frag_alpha: torch.Tensor
 
 
 # ---------------------------------------------------------------------------
@@ -56,7 +64,8 @@ def rasterize_multires_triangle_alpha(
     level: int,
     alpha_src: torch.Tensor,
     stochastic: bool = True,
-) -> torch.Tensor:
+    return_fragments: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, RasterizationFragments]:
     """Rasterise with per-fragment multi-resolution opacity and depth testing.
 
     Args:
@@ -69,10 +78,14 @@ def rasterize_multires_triangle_alpha(
         stochastic:  If ``True`` (default), the alpha threshold is sampled
                      uniformly per fragment; otherwise a fixed 0.5 threshold
                      is used.
+        return_fragments: Return the fragment intermediates together with the
+                     raster buffer so they can be reused by
+                     :func:`diffsoup.opacity_aux_loss`.
 
     Returns:
-        rast_out: ``(B, H, W, 4)`` float32 CUDA — each pixel stores
-        ``(bary0, bary1, z, triangle_id+1)``.
+        ``rast_out`` by default.  When ``return_fragments=True``, returns
+        ``(rast_out, fragments)`` where ``fragments`` can be passed directly
+        to :func:`diffsoup.opacity_aux_loss`.
     """
     H, W = resolution
     B, V, _ = pos.shape
@@ -91,15 +104,22 @@ def rasterize_multires_triangle_alpha(
 
     min_level = max_level = level
     alpha_src_2d = alpha_src.squeeze(-1)
-    frag_alpha = torch.zeros(num_frags, dtype=torch.float32, device=dev)
-    _core.multires_triangle_alpha(frag_attrs, min_level, max_level, alpha_src_2d, frag_alpha)
+    # Every valid fragment is written by the CUDA kernel.
+    frag_alpha = torch.empty(num_frags, dtype=torch.float32, device=dev)
+    _core.multires_triangle_alpha(
+        frag_attrs, min_level, max_level, alpha_src_2d, frag_alpha,
+        _rz._cuda_stream(pos),
+    )
 
     if stochastic:
         alpha_thresh = torch.rand(num_frags, dtype=torch.float32, device=dev)
     else:
         alpha_thresh = torch.full((num_frags,), 0.5, dtype=torch.float32, device=dev)
 
-    return _rz._depth_test((H, W), pos, frag_pix, frag_attrs, frag_alpha, alpha_thresh)
+    rast = _rz._depth_test((H, W), pos, frag_pix, frag_attrs, frag_alpha, alpha_thresh)
+    if return_fragments:
+        return rast, RasterizationFragments(frag_pix, frag_attrs, frag_alpha)
+    return rast
 
 
 # ---------------------------------------------------------------------------
@@ -218,26 +238,28 @@ class _MultiresTriangleColorFn(torch.autograd.Function):
         _, _, feat_dim = feat.shape
         dev = rast.device
 
-        out = torch.zeros((B, H, W, feat_dim), dtype=torch.float32, device=dev)
-        _core.multires_triangle_color(rast, min_level, max_level, feat, out)
-
-        ctx.save_for_backward(
-            rast,
-            torch.tensor([min_level, max_level], dtype=torch.int32),
-            feat,
+        out = torch.empty((B, H, W, feat_dim), dtype=torch.float32, device=dev)
+        _core.multires_triangle_color(
+            rast, min_level, max_level, feat, out, _rz._cuda_stream(rast)
         )
+
+        ctx.min_level = min_level
+        ctx.max_level = max_level
+        ctx.feat_shape = feat.shape
+        ctx.save_for_backward(rast)
         return out
 
     @staticmethod
     def backward(ctx, grad_out):
-        rast, levels, feat = ctx.saved_tensors
-        min_level = levels[0].item()
-        max_level = levels[1].item()
+        (rast,) = ctx.saved_tensors
 
         grad_out = grad_out.contiguous()
-        grad_feat = torch.zeros_like(feat)
+        grad_feat = torch.zeros(
+            ctx.feat_shape, dtype=torch.float32, device=rast.device
+        )
         _core.backward_multires_triangle_color(
-            rast, min_level, max_level, grad_feat, grad_out
+            rast, ctx.min_level, ctx.max_level, grad_feat, grad_out,
+            _rz._cuda_stream(grad_out),
         )
         return None, None, None, grad_feat
 
@@ -283,28 +305,45 @@ class _AccumulateToLevelFn(torch.autograd.Function):
         dev = feat.device
 
         S_L = feats_at_level(target_level)
-        feat_out = torch.zeros(T, S_L, feat_dim, dtype=torch.float32, device=dev)
+        num_levels = max_level - min_level + 1
+        plan_indices = torch.empty(
+            S_L, num_levels, 3, dtype=torch.int32, device=dev
+        )
+        plan_weights = torch.empty(
+            S_L, num_levels, 3, dtype=torch.float32, device=dev
+        )
+        stream = _rz._cuda_stream(feat)
+        _core.build_accumulation_plan(
+            min_level, max_level, target_level,
+            plan_indices, plan_weights, stream,
+        )
+        # The CUDA kernel assigns every output element before returning.
+        feat_out = torch.empty(T, S_L, feat_dim, dtype=torch.float32, device=dev)
         _core.accumulate_to_level_forward(
-            min_level, max_level, target_level, feat, feat_out
+            min_level, max_level, target_level, feat,
+            plan_indices, plan_weights, feat_out, stream,
         )
 
-        ctx.save_for_backward(
-            torch.tensor([min_level, max_level, target_level], dtype=torch.int32),
-            feat,
-        )
+        ctx.min_level = min_level
+        ctx.max_level = max_level
+        ctx.target_level = target_level
+        ctx.feat_shape = feat.shape
+        ctx.save_for_backward(plan_indices, plan_weights)
         return feat_out
 
     @staticmethod
     def backward(ctx, grad_feat_out):
-        levels, feat = ctx.saved_tensors
-        min_level = levels[0].item()
-        max_level = levels[1].item()
-        target_level = levels[2].item()
+        plan_indices, plan_weights = ctx.saved_tensors
 
         grad_feat_out = grad_feat_out.contiguous()
-        grad_feat = torch.zeros_like(feat)
+        grad_feat = torch.zeros(
+            ctx.feat_shape, dtype=torch.float32, device=grad_feat_out.device
+        )
+        stream = _rz._cuda_stream(grad_feat_out)
         _core.accumulate_to_level_backward(
-            min_level, max_level, target_level, grad_feat, grad_feat_out
+            ctx.min_level, ctx.max_level, ctx.target_level,
+            grad_feat, grad_feat_out,
+            plan_indices, plan_weights, stream,
         )
         return None, None, None, grad_feat
 
@@ -331,9 +370,13 @@ def accumulate_to_level(
     Returns:
         ``(T, S_target, C)`` float32 CUDA — accumulated features.
     """
-    assert min_level >= 0
+    assert 0 <= min_level <= max_level
     assert feat.ndim == 3 and feat.dtype == torch.float32
     assert feat.is_contiguous() and feat.is_cuda
+    assert feat.shape[1] == sum(
+        feats_at_level(level) for level in range(min_level, max_level + 1)
+    )
     if target_level is None:
         target_level = max_level
+    assert target_level >= 0
     return _AccumulateToLevelFn.apply(min_level, max_level, target_level, feat)

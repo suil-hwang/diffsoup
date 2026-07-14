@@ -161,13 +161,14 @@ void multires_triangle_alpha(
     const uint32_t min_level,
     const uint32_t max_level,
     const float* alpha_src,                 // [T, S], where T is triangle count and S = Σ (2^(level - 1) + 1) * (2^level + 1)
-    float* __restrict__ frag_alpha          // [num_frags]
+    float* __restrict__ frag_alpha,         // [num_frags]
+    cudaStream_t stream
 ) {
     if (num_frags == 0) return;
 
     const uint32_t S = total_feats_from_levels(min_level, max_level);
 
-    multires_triangle_alpha_kernel<<<CUDA_BLOCKS(num_frags), CUDA_THREADS>>>(
+    multires_triangle_alpha_kernel<<<CUDA_BLOCKS(num_frags), CUDA_THREADS, 0, stream>>>(
         num_frags, frag_attrs, min_level, max_level, S,
         alpha_src, frag_alpha
     );
@@ -207,13 +208,14 @@ void backward_multires_triangle_alpha(
     const uint32_t min_level,
     const uint32_t max_level,
     float* grad_alpha_src,                      // [T, S], where T is triangle count and S = Σ (2^(level - 1) + 1) * (2^level + 1)
-    const float* __restrict__ grad_frag_alpha   // [num_frags]
+    const float* __restrict__ grad_frag_alpha,  // [num_frags]
+    cudaStream_t stream
 ) {
     if (num_frags == 0) return;
 
     const uint32_t S = total_feats_from_levels(min_level, max_level);
 
-    backward_multires_triangle_alpha_kernel<<<CUDA_BLOCKS(num_frags), CUDA_THREADS>>>(
+    backward_multires_triangle_alpha_kernel<<<CUDA_BLOCKS(num_frags), CUDA_THREADS, 0, stream>>>(
         num_frags, frag_attrs, min_level, max_level, S,
         grad_alpha_src, grad_frag_alpha
     );
@@ -235,10 +237,21 @@ __global__ void multires_triangle_color_kernel(
     if (idx >= B * H * W) return;
 
     const int tri_id = static_cast<int>(rast[idx * 4 + 3]) - 1;
-    if (tri_id < 0) return;
+    if (tri_id < 0) {
+        #pragma unroll 4
+        for (uint32_t c = 0; c < feature_dim; ++c) {
+            out[idx * feature_dim + c] = 0.f;
+        }
+        return;
+    }
 
     const float b0 = rast[idx * 4 + 0];
     const float b1 = rast[idx * 4 + 1];
+
+    #pragma unroll 4
+    for (uint32_t c = 0; c < feature_dim; ++c) {
+        out[idx * feature_dim + c] = 0.f;
+    }
 
     multires_triangle_interp_d(
         b0, b1, min_level, max_level, feature_dim,
@@ -253,11 +266,12 @@ void multires_triangle_color(
     const uint32_t max_level,
     const uint32_t feature_dim,
     const float* features,                   // [B, S, feature_dim]
-    float* out                               // [B, H, W, feature_dim]
+    float* out,                              // [B, H, W, feature_dim]
+    cudaStream_t stream
 ) {
     const uint32_t S = total_feats_from_levels(min_level, max_level);
 
-    multires_triangle_color_kernel<<<CUDA_BLOCKS(B * H * W), CUDA_THREADS>>>(
+    multires_triangle_color_kernel<<<CUDA_BLOCKS(B * H * W), CUDA_THREADS, 0, stream>>>(
         B, H, W, rast, min_level, max_level,
         S, feature_dim, features, out
     );
@@ -298,11 +312,12 @@ void backward_multires_triangle_color(
     const uint32_t max_level,
     const uint32_t feature_dim,
     float* grad_features,                // [T, S, feature_dim], where T is triangle count and S = Σ (2^(level - 1) + 1) * (2^level + 1)
-    const float* __restrict__ grad_out   // [B, H, W, feature_dim]
+    const float* __restrict__ grad_out,  // [B, H, W, feature_dim]
+    cudaStream_t stream
 ) {
     const uint32_t S = total_feats_from_levels(min_level, max_level);
 
-    backward_multires_triangle_color_kernel<<<CUDA_BLOCKS(B * H * W), CUDA_THREADS>>>(
+    backward_multires_triangle_color_kernel<<<CUDA_BLOCKS(B * H * W), CUDA_THREADS, 0, stream>>>(
         B, H, W, rast, min_level, max_level,
         S, feature_dim, grad_features, grad_out
     );
@@ -324,127 +339,231 @@ inline __device__ void index_to_xy_on_level(uint32_t L, uint32_t idx, uint32_t& 
     // nothing else to do here.
 }
 
-// --- forward: accumulate all levels (min..target) -> target lattice --------
+// The target lattice is identical for every triangle and feature channel.
+// Build its sparse interpolation plan once per autograd invocation, then use a
+// scalar thread mapping over (triangle, target sample, channel).  This changes
+// strided C=7 accesses into scalar, coalesced accesses and avoids repeating the
+// lattice decode in both forward and backward.
 
-__global__ void accumulate_to_level_forward_kernel(
-    int T,                                   // triangle count
-    const uint32_t min_level,                // included
-    const uint32_t max_level,                // included
-    const uint32_t target_level,             // included; target_level >= min_level
-    const uint32_t S_stride_total,           // Σ_{l=min..concat_level} S_l (per-triangle stride)
-    const uint32_t S_T,                      // S at level L=target_level
-    const uint32_t feature_dim,
-    const float* __restrict__ features,      // [T, S_stride_total, C]
-    float* __restrict__ f_target             // [T, S_T, C]
+__global__ void build_accumulation_plan_kernel(
+    const uint32_t min_level,
+    const uint32_t max_level,
+    const uint32_t target_level,
+    const uint32_t S_T,
+    const uint32_t num_levels,
+    int* __restrict__ plan_indices,
+    float* __restrict__ plan_weights
 ) {
-    const uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint64_t N   = static_cast<uint64_t>(T) * static_cast<uint64_t>(S_T);
+    const uint32_t k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= S_T) return;
+
+    uint32_t x_target, y_target;
+    index_to_xy_on_level(target_level, k, x_target, y_target);
+
+    const float target_res = static_cast<float>(1u << target_level);
+    const float b0 = static_cast<float>(x_target) / target_res;
+    const float b1 = static_cast<float>(y_target) / target_res;
+
+    uint32_t feature_offset = 0;
+    for (uint32_t slot = 0; slot < num_levels; ++slot) {
+        const uint32_t level = min_level + slot;
+        const uint32_t res = 1u << level;
+        const float res_f = static_cast<float>(res);
+
+        float b0_level = b0 * res_f;
+        float b1_level = b1 * res_f;
+
+        const uint32_t x = MIN(static_cast<uint32_t>(floorf(b0_level)), res - 1u);
+        const uint32_t y = MIN(static_cast<uint32_t>(floorf(b1_level)), res - 1u - x);
+
+        b0_level -= static_cast<float>(x);
+        b1_level -= static_cast<float>(y);
+
+        const bool flip = b0_level + b1_level > 1.f;
+        const uint32_t flip_u = static_cast<uint32_t>(flip);
+        const float flip_f = static_cast<float>(flip);
+
+        const uint32_t px[3] = {x + 1u, x, x + flip_u};
+        const uint32_t py[3] = {
+            y,
+            y + 1u,
+            MIN(y + flip_u, res - (x + flip_u)),
+        };
+
+        const float weights[3] = {
+            (1.f - flip_f) * b0_level + flip_f * (1.f - b1_level),
+            (1.f - flip_f) * b1_level + flip_f * (1.f - b0_level),
+            0.f,
+        };
+
+        const uint32_t base = (k * num_levels + slot) * 3u;
+        #pragma unroll
+        for (uint32_t i = 0; i < 3; ++i) {
+            const uint32_t n = px[i] + py[i];
+            plan_indices[base + i] = static_cast<int>(
+                feature_offset + n * (n + 1u) / 2u + py[i]
+            );
+        }
+        plan_weights[base + 0] = weights[0];
+        plan_weights[base + 1] = weights[1];
+        plan_weights[base + 2] = 1.f - weights[0] - weights[1];
+
+        feature_offset += level == 0u
+            ? 3u
+            : (((1u << (level - 1u)) + 1u) * ((1u << level) + 1u));
+    }
+}
+
+void build_accumulation_plan(
+    const uint32_t min_level,
+    const uint32_t max_level,
+    const uint32_t target_level,
+    int* __restrict__ plan_indices,
+    float* __restrict__ plan_weights,
+    cudaStream_t stream
+) {
+    const uint32_t S_T = feats_at_level(target_level);
+    const uint32_t num_levels = max_level - min_level + 1u;
+    build_accumulation_plan_kernel<<<CUDA_BLOCKS(S_T), CUDA_THREADS, 0, stream>>>(
+        min_level, max_level, target_level, S_T, num_levels,
+        plan_indices, plan_weights
+    );
+    CUDA_CHECK(cudaGetLastError());
+}
+
+__global__ void accumulate_to_level_forward_planned_kernel(
+    int T,
+    const uint32_t S_stride_total,
+    const uint32_t S_T,
+    const uint32_t num_levels,
+    const uint32_t feature_dim,
+    const float* __restrict__ features,
+    const int* __restrict__ plan_indices,
+    const float* __restrict__ plan_weights,
+    float* __restrict__ f_target
+) {
+    const uint64_t tid = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t N = static_cast<uint64_t>(T) * S_T * feature_dim;
     if (tid >= N) return;
 
-    const uint32_t t = static_cast<uint32_t>(tid / S_T);
-    const uint32_t k = static_cast<uint32_t>(tid % S_T);
+    const uint32_t c = static_cast<uint32_t>(tid % feature_dim);
+    const uint64_t sample = tid / feature_dim;
+    const uint32_t k = static_cast<uint32_t>(sample % S_T);
+    const uint32_t t = static_cast<uint32_t>(sample / S_T);
 
-    // decode (x,y) at target level
-    uint32_t x, y;
-    index_to_xy_on_level(target_level, k, x, y);
-
-    const float Rf = static_cast<float>(1u << target_level);
-    const float b0 = static_cast<float>(x) / Rf;
-    const float b1 = static_cast<float>(y) / Rf;
-
-    // output pointer (zero then accumulate)
-    float* out = &f_target[(static_cast<uint64_t>(t) * S_T + k) * feature_dim];
-    #pragma unroll 4
-    for (uint32_t c = 0; c < feature_dim; ++c) out[c] = 0.f;
-
-    // evaluate existing multires function exactly at this target-vertex
-    const float* tri_feats = &features[(static_cast<uint64_t>(t) * S_stride_total) * feature_dim];
-    multires_triangle_interp_d(
-        b0, b1,
-        /*min_level=*/min_level, /*max_level=*/max_level,
-        feature_dim,
-        tri_feats,   // [Σ_{l=min..concat} S_l, C] but only min..target are read
-        out          // [C]
-    );
+    const uint32_t plan_base = k * num_levels * 3u;
+    float value = 0.f;
+    for (uint32_t slot = 0; slot < num_levels; ++slot) {
+        const uint32_t base = plan_base + slot * 3u;
+        #pragma unroll
+        for (uint32_t i = 0; i < 3; ++i) {
+            const uint64_t src = (
+                static_cast<uint64_t>(t) * S_stride_total
+                + static_cast<uint32_t>(plan_indices[base + i])
+            ) * feature_dim + c;
+            value += plan_weights[base + i] * features[src];
+        }
+    }
+    f_target[tid] = value;
 }
 
 void accumulate_to_level_forward(
     int T,
     const uint32_t min_level,
-    const uint32_t max_level,                // original “max” used for layout/stride
-    const uint32_t target_level,             // ≤ max_level
+    const uint32_t max_level,
+    const uint32_t target_level,
     const uint32_t feature_dim,
-    const float* __restrict__ features,      // [T, Σ_{l=min..concat} S_l, C]
-    float* __restrict__ f_target             // [T, feats_at_level(target_level), C]
+    const float* __restrict__ features,
+    const int* __restrict__ plan_indices,
+    const float* __restrict__ plan_weights,
+    float* __restrict__ f_target,
+    cudaStream_t stream
 ) {
-    if (T == 0) return;
+    if (T == 0 || feature_dim == 0) return;
     const uint32_t S_stride_total = total_feats_from_levels(min_level, max_level);
-    const uint32_t S_T            = feats_at_level(target_level);
+    const uint32_t S_T = feats_at_level(target_level);
+    const uint32_t num_levels = max_level - min_level + 1u;
 
-    const uint64_t N = static_cast<uint64_t>(T) * static_cast<uint64_t>(S_T);
-    accumulate_to_level_forward_kernel<<<CUDA_BLOCKS(N), CUDA_THREADS>>>(
-        T, min_level, max_level, target_level, S_stride_total, S_T, feature_dim, features, f_target
+    const uint64_t N = static_cast<uint64_t>(T) * S_T * feature_dim;
+    accumulate_to_level_forward_planned_kernel<<<CUDA_BLOCKS(N), CUDA_THREADS, 0, stream>>>(
+        T, S_stride_total, S_T, num_levels, feature_dim,
+        features, plan_indices, plan_weights, f_target
     );
     CUDA_CHECK(cudaGetLastError());
 }
 
-// --- backward: grad wrt multires levels from grad at target lattice --------
-
-__global__ void accumulate_to_level_backward_kernel(
+__global__ void accumulate_to_level_backward_planned_kernel(
     int T,
-    const uint32_t min_level,
-    const uint32_t max_level,
-    const uint32_t target_level,
-    const uint32_t S_stride_total,           // Σ_{l=min..concat} S_l
-    const uint32_t S_T,                      // feats_at_level(target_level)
+    const uint32_t S_stride_total,
+    const uint32_t S_T,
+    const uint32_t num_levels,
+    const uint32_t first_direct_slot,
     const uint32_t feature_dim,
-    float* __restrict__ grad_features,       // [T, Σ_{l=min..concat} S_l, C]  (zeroed by caller)
-    const float* __restrict__ grad_f_target  // [T, S_T, C]
+    float* __restrict__ grad_features,
+    const float* __restrict__ grad_f_target,
+    const int* __restrict__ plan_indices,
+    const float* __restrict__ plan_weights
 ) {
-    const uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint64_t N   = static_cast<uint64_t>(T) * static_cast<uint64_t>(S_T);
+    const uint64_t tid = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t N = static_cast<uint64_t>(T) * S_T * feature_dim;
     if (tid >= N) return;
 
-    const uint32_t t = static_cast<uint32_t>(tid / S_T);
-    const uint32_t k = static_cast<uint32_t>(tid % S_T);
+    const uint32_t c = static_cast<uint32_t>(tid % feature_dim);
+    const uint64_t sample = tid / feature_dim;
+    const uint32_t k = static_cast<uint32_t>(sample % S_T);
+    const uint32_t t = static_cast<uint32_t>(sample / S_T);
+    const float grad = grad_f_target[tid];
 
-    // decode (x,y) at target level
-    uint32_t x, y;
-    index_to_xy_on_level(target_level, k, x, y);
-
-    const float Rf = static_cast<float>(1u << target_level);
-    const float b0 = static_cast<float>(x) / Rf;
-    const float b1 = static_cast<float>(y) / Rf;
-
-    float* tri_grad_feats = &grad_features[(static_cast<uint64_t>(t) * S_stride_total) * feature_dim];
-    const float* grad_out = &grad_f_target[(static_cast<uint64_t>(t) * S_T + k) * feature_dim];
-
-    // scatter-add into grad_features using your existing backward device fn
-    backward_multires_triangle_interp_d(
-        b0, b1,
-        /*min_level=*/min_level, /*max_level=*/max_level,
-        feature_dim,
-        tri_grad_feats,   // atomicAdd inside helper
-        grad_out
-    );
+    const uint32_t plan_base = k * num_levels * 3u;
+    for (uint32_t slot = 0; slot < num_levels; ++slot) {
+        const uint32_t base = plan_base + slot * 3u;
+        #pragma unroll
+        for (uint32_t i = 0; i < 3; ++i) {
+            const float weight = plan_weights[base + i];
+            // Target lattice vertices produce many exact zero weights.  They
+            // carry no gradient and need not contend on the atomic address.
+            if (weight == 0.f) continue;
+            const uint64_t dst = (
+                static_cast<uint64_t>(t) * S_stride_total
+                + static_cast<uint32_t>(plan_indices[base + i])
+            ) * feature_dim + c;
+            // At levels at least as fine as the target lattice, every target
+            // vertex maps injectively to one stored vertex.  Those writes
+            // cannot collide, so only coarser levels need atomic accumulation.
+            if (slot >= first_direct_slot) {
+                grad_features[dst] = grad * weight;
+            }
+            else {
+                atomicAdd(&grad_features[dst], grad * weight);
+            }
+        }
+    }
 }
 
 void accumulate_to_level_backward(
     int T,
     const uint32_t min_level,
-    const uint32_t max_level,                // original “max” used for layout/stride
-    const uint32_t target_level,             // ≤ max_level
+    const uint32_t max_level,
+    const uint32_t target_level,
     const uint32_t feature_dim,
-    float* __restrict__ grad_features,       // [T, Σ_{l=min..concat} S_l, C]  (zero before call)
-    const float* __restrict__ grad_f_target  // [T, feats_at_level(target_level), C]
+    float* __restrict__ grad_features,
+    const float* __restrict__ grad_f_target,
+    const int* __restrict__ plan_indices,
+    const float* __restrict__ plan_weights,
+    cudaStream_t stream
 ) {
-    if (T == 0) return;
+    if (T == 0 || feature_dim == 0) return;
     const uint32_t S_stride_total = total_feats_from_levels(min_level, max_level);
-    const uint32_t S_T            = feats_at_level(target_level);
+    const uint32_t S_T = feats_at_level(target_level);
+    const uint32_t num_levels = max_level - min_level + 1u;
+    const uint32_t first_direct_slot = target_level <= min_level
+        ? 0u
+        : (target_level > max_level ? num_levels : target_level - min_level);
 
-    const uint64_t N = static_cast<uint64_t>(T) * static_cast<uint64_t>(S_T);
-    accumulate_to_level_backward_kernel<<<CUDA_BLOCKS(N), CUDA_THREADS>>>(
-        T, min_level, max_level, target_level, S_stride_total, S_T, feature_dim, grad_features, grad_f_target
+    const uint64_t N = static_cast<uint64_t>(T) * S_T * feature_dim;
+    accumulate_to_level_backward_planned_kernel<<<CUDA_BLOCKS(N), CUDA_THREADS, 0, stream>>>(
+        T, S_stride_total, S_T, num_levels, first_direct_slot, feature_dim,
+        grad_features, grad_f_target, plan_indices, plan_weights
     );
     CUDA_CHECK(cudaGetLastError());
 }

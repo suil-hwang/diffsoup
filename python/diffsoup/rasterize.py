@@ -7,6 +7,11 @@ from typing import Tuple
 from . import _core
 
 
+def _cuda_stream(tensor: torch.Tensor) -> int:
+    """Return PyTorch's current CUDA stream handle for the tensor device."""
+    return torch.cuda.current_stream(tensor.device).cuda_stream
+
+
 # ---------------------------------------------------------------------------
 #  Fragment computation
 # ---------------------------------------------------------------------------
@@ -25,15 +30,21 @@ def _filter_valid_fragments(
         Compacted ``frag_pix`` and ``frag_attrs`` tensors containing only
         valid fragments.
     """
-    frag_pix_out = torch.empty_like(frag_pix)
-    frag_attrs_out = torch.empty_like(frag_attrs)
-
-    valid_count = _core.filter_valid_fragments(
-        frag_pix, frag_attrs, frag_pix_out, frag_attrs_out
+    counter = torch.empty(1, dtype=torch.int32, device=frag_pix.device)
+    stream = _cuda_stream(frag_pix)
+    valid_count = _core.count_valid_fragments(
+        frag_pix, counter, stream,
     )
-
-    frag_pix_out = frag_pix_out[:valid_count].contiguous()
-    frag_attrs_out = frag_attrs_out[:valid_count].contiguous()
+    frag_pix_out = torch.empty(
+        (valid_count, 3), dtype=torch.int32, device=frag_pix.device
+    )
+    frag_attrs_out = torch.empty(
+        (valid_count, 4), dtype=torch.float32, device=frag_attrs.device
+    )
+    _core.compact_valid_fragments(
+        frag_pix, frag_attrs, frag_pix_out, frag_attrs_out,
+        counter, stream,
+    )
     return frag_pix_out, frag_attrs_out
 
 
@@ -64,13 +75,16 @@ def _compute_fragments(
 
     rects = torch.empty((B * T, 4), dtype=torch.int32, device=device)
     frag_prefix = torch.empty(B * T, dtype=torch.int32, device=device)
-    num_frags = _core.compute_triangle_rects(H, W, pos, tri, rects, frag_prefix)
+    stream = _cuda_stream(pos)
+    num_frags = _core.compute_triangle_rects(
+        H, W, pos, tri, rects, frag_prefix, stream
+    )
 
-    frag_pix = torch.full((num_frags, 3), -1, dtype=torch.int32, device=device)
+    frag_pix = torch.empty((num_frags, 3), dtype=torch.int32, device=device)
     frag_attrs = torch.empty((num_frags, 4), dtype=torch.float32, device=device)
 
     _core.compute_fragments(
-        H, W, pos, tri, frag_prefix, rects, frag_pix, frag_attrs
+        H, W, pos, tri, frag_prefix, rects, frag_pix, frag_attrs, stream
     )
 
     return _filter_valid_fragments(frag_pix, frag_attrs)
@@ -121,8 +135,12 @@ def _depth_test(
     assert frag_alpha.device == device
     assert alpha_thresh.device == device
 
-    rast = torch.zeros(B, H, W, 4, dtype=torch.float32, device=device)
-    _core.depth_test(frag_pix, frag_attrs, frag_alpha, alpha_thresh, rast)
+    frag_index = torch.empty(B, H, W, dtype=torch.int64, device=device)
+    rast = torch.empty(B, H, W, 4, dtype=torch.float32, device=device)
+    _core.depth_test(
+        frag_pix, frag_attrs, frag_alpha, alpha_thresh,
+        frag_index, rast, _cuda_stream(pos),
+    )
     return rast
 
 
@@ -150,34 +168,25 @@ class _OpacityAuxLossFn(torch.autograd.Function):
         color: torch.Tensor,       # (B, H, W, C)
         target: torch.Tensor,      # (B, H, W, C)
         rast: torch.Tensor,        # (B, H, W, 4)
-        pos: torch.Tensor,
-        tri: torch.Tensor,
         level: int,
         alpha_src: torch.Tensor,
+        frag_pix: torch.Tensor,
+        frag_attrs: torch.Tensor,
+        frag_alpha: torch.Tensor,
     ) -> torch.Tensor:
-        _, H, W, _ = rast.shape
         dev = rast.device
         assert alpha_src.ndim == 2
 
-        frag_pix, frag_attrs = _compute_fragments((H, W), pos, tri)
-        num_frags = frag_pix.shape[0]
-
-        min_level = max_level = level
-        frag_alpha = torch.zeros(num_frags, dtype=torch.float32, device=dev)
-        _core.multires_triangle_alpha(
-            frag_attrs, min_level, max_level, alpha_src, frag_alpha
-        )
-
-        grad_frag_alpha = torch.zeros_like(frag_alpha)
+        grad_frag_alpha = torch.empty_like(frag_alpha)
         _core.backward_opacity_aux_loss(
             color, target, rast, frag_pix, frag_attrs,
-            frag_alpha, grad_frag_alpha
+            frag_alpha, grad_frag_alpha, _cuda_stream(rast),
         )
 
         grad_alpha_src = torch.zeros_like(alpha_src)
         _core.backward_multires_triangle_alpha(
-            frag_attrs, min_level, max_level,
-            grad_alpha_src, grad_frag_alpha
+            frag_attrs, level, level,
+            grad_alpha_src, grad_frag_alpha, _cuda_stream(rast),
         )
 
         weight = 1.0 / color.numel()
@@ -193,7 +202,7 @@ class _OpacityAuxLossFn(torch.autograd.Function):
     def backward(ctx, grad_loss: torch.Tensor):
         grad_alpha_src, weight = ctx.saved_tensors
         grad_alpha_src = weight.item() * grad_loss * grad_alpha_src
-        return None, None, None, None, None, None, grad_alpha_src
+        return None, None, None, None, grad_alpha_src, None, None, None
 
 
 def opacity_aux_loss(
@@ -204,6 +213,7 @@ def opacity_aux_loss(
     tri: torch.Tensor,         # (T, 3)
     level: int,
     alpha_src: torch.Tensor,
+    fragments=None,
 ) -> torch.Tensor:
     """Stochastic opacity masking auxiliary loss (zero-valued gradient hook).
 
@@ -227,6 +237,9 @@ def opacity_aux_loss(
         level:     Multi-resolution level (≥ 0).
         alpha_src: Per-triangle opacity features ``(T, S, 1)``, float32 CUDA,
                    where ``S = feats_at_level(level)``.
+        fragments: Optional fragment intermediates returned by
+                   ``rasterize_multires_triangle_alpha(..., return_fragments=True)``.
+                   When omitted, fragments are recomputed for compatibility.
 
     Returns:
         A zero-valued float32 CUDA scalar with an autograd backward that
@@ -249,7 +262,28 @@ def opacity_aux_loss(
     assert pos.device == dev and tri.device == dev
 
     alpha_src = alpha_src.squeeze(-1)
-    return _OpacityAuxLossFn.apply(color, target, rast, pos, tri, level, alpha_src)
+    if fragments is None:
+        frag_pix, frag_attrs = _compute_fragments((H, W), pos, tri)
+        frag_alpha = torch.empty(frag_pix.shape[0], dtype=torch.float32, device=dev)
+        _core.multires_triangle_alpha(
+            frag_attrs, level, level, alpha_src, frag_alpha,
+            _cuda_stream(rast),
+        )
+    else:
+        if len(fragments) != 3:
+            raise ValueError("fragments must contain frag_pix, frag_attrs, and frag_alpha")
+        frag_pix, frag_attrs, frag_alpha = fragments
+        num_frags = frag_pix.shape[0]
+        assert frag_pix.shape == (num_frags, 3) and frag_pix.dtype == torch.int32
+        assert frag_attrs.shape == (num_frags, 4) and frag_attrs.dtype == torch.float32
+        assert frag_alpha.shape == (num_frags,) and frag_alpha.dtype == torch.float32
+        assert frag_pix.is_contiguous() and frag_attrs.is_contiguous() and frag_alpha.is_contiguous()
+        assert frag_pix.device == dev and frag_attrs.device == dev and frag_alpha.device == dev
+
+    return _OpacityAuxLossFn.apply(
+        color, target, rast, level, alpha_src,
+        frag_pix, frag_attrs, frag_alpha,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +304,9 @@ class _EdgeGradFn(torch.autograd.Function):
         grad_color = grad_color.contiguous()
         grad_pos = torch.zeros_like(pos)
 
-        _core.backward_edge_grad(color, grad_color, rast, pos, grad_pos, tri)
+        _core.backward_edge_grad(
+            color, grad_color, rast, pos, grad_pos, tri, _cuda_stream(color)
+        )
         return grad_color, None, grad_pos, None
 
 
@@ -336,8 +372,8 @@ def encode_view_dir_sh2(
     assert inv_mvp.shape == (B, 4, 4) and inv_mvp.is_contiguous() and inv_mvp.dtype == torch.float32
     assert rast.is_cuda and inv_mvp.device == dev
 
-    encoding = torch.zeros(B, H, W, 9, dtype=torch.float32, device=dev)
-    _core.encode_view_dir_sh2(rast, inv_mvp, encoding)
+    encoding = torch.empty(B, H, W, 9, dtype=torch.float32, device=dev)
+    _core.encode_view_dir_sh2(rast, inv_mvp, encoding, _cuda_stream(rast))
     return encoding
 
 

@@ -9,7 +9,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <type_traits>
+#include <stdexcept>
 #include <cuda_runtime.h>
 
 #define CUDA_THREADS 256
@@ -22,7 +22,7 @@
         if (err != cudaSuccess) { \
             fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__, \
                     cudaGetErrorString(err)); \
-            exit(1); \
+            throw std::runtime_error(cudaGetErrorString(err)); \
         } \
     } while(0)
 
@@ -64,19 +64,6 @@ __device__ __host__ constexpr T clamp(T x, T lo, T hi) {
 template<typename T>
 __device__ __host__ constexpr T lerp(T a, T b, T t) { 
     return a + t * (b - a); 
-}
-
-// Memory helpers
-template<typename T>
-T* malloc_gpu(size_t count) {
-    T* ptr;
-    CUDA_CHECK(cudaMalloc(&ptr, count * sizeof(T)));
-    return ptr;
-}
-
-template<typename T>
-void free_gpu(T* ptr) {
-    if (ptr) CUDA_CHECK(cudaFree(ptr));
 }
 
 namespace {

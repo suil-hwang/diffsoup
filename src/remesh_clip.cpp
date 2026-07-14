@@ -174,7 +174,7 @@ TriangleSoupSplitterClip::TriangleSoupSplitterClip(
     const int* valid_tris)
     : originalNumTriangles(nt)
 {
-    // now 4 floats per vertex
+    // Flat xyz coordinates: 3 floats per vertex.
     vertices.assign(verts, verts + nv * 3);
     triangles.assign(tris, tris + nt * 3);
     valid_triangles.assign(valid_tris, valid_tris + nt);
@@ -202,8 +202,8 @@ void TriangleSoupSplitterClip::splitLongEdges(int numSplits, float tau_ratio, fl
     }
 
     if (numSplits > 0) {
-        // 2 new verts per split * 4 floats
-        vertices.reserve(vertices.size() + static_cast<size_t>(numSplits) * 8);
+        // mA, mB, and cA: 3 new vertices per split * 3 floats.
+        vertices.reserve(vertices.size() + static_cast<size_t>(numSplits) * 9);
         triangles.reserve(triangles.size() + static_cast<size_t>(numSplits) * 3);
         triGen.reserve(triGen.size() + static_cast<size_t>(numSplits));
         triOrigin.reserve(triOrigin.size() + static_cast<size_t>(numSplits));

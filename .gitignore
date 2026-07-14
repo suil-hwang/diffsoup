@@ -216,3 +216,5 @@ web/data/
 datasets/
 
 tests/
+/tests/
+/tests/**

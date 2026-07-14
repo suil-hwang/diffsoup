@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <cuda_runtime.h>
+
 namespace diffsoup {
 namespace cuda {
 
@@ -12,7 +14,8 @@ int compute_triangle_rects(
     int V, const float* pos,     // [B * V][4]
     int T, const int* tri,       // [T][3]
     int* triangle_rects,         // [B * T][4]: h0, h_len, w0, w_len
-    int* frag_prefix_sum         // [B * T]
+    int* frag_prefix_sum,        // [B * T]
+    cudaStream_t stream
 );
 
 void compute_fragments(
@@ -24,7 +27,8 @@ void compute_fragments(
     const int* frag_prefix_sum,
     const int* triangle_rects,
     int* frag_pix,
-    float* frag_attrs
+    float* frag_attrs,
+    cudaStream_t stream
 );
 
 void depth_test(
@@ -34,15 +38,26 @@ void depth_test(
     const float* frag_attrs,   // [num_frags, 4]
     const float* frag_alpha,   // [num_frags]
     const float* alpha_thresh, // [num_frags]
-    float* rast_out            // [B, H, W, 4]
+    long long* frag_index,     // [B, H, W] workspace
+    float* rast_out,           // [B, H, W, 4]
+    cudaStream_t stream
 );
 
-int filter_valid_fragments(
+int count_valid_fragments(
+    int num_frags,
+    const int* frag_pix,         // [num_frags, 3]
+    int* global_counter,         // [1] workspace
+    cudaStream_t stream
+);
+
+void compact_valid_fragments(
     int num_frags,
     const int* frag_pix,         // [num_frags, 3]
     const float* frag_attrs,     // [num_frags, 4]
     int* frag_pix_out,           // [num_frags, 3]
-    float* frag_attrs_out        // [num_frags, 4]
+    float* frag_attrs_out,       // [num_frags, 4]
+    int* global_counter,         // [1] workspace
+    cudaStream_t stream
 );
 
 void backward_edge_grad(
@@ -53,7 +68,8 @@ void backward_edge_grad(
     int V,
     const float* __restrict__ pos,           // [B, V, 4]
     float* __restrict__ grad_pos,            // [B, V, 4]
-    const int* __restrict__ tri              // [T, 3]
+    const int* __restrict__ tri,             // [T, 3]
+    cudaStream_t stream
 );
 
 void backward_opacity_aux_loss(
@@ -65,7 +81,8 @@ void backward_opacity_aux_loss(
     const int* __restrict__ frag_pix,        // [num_frags, 3]
     const float* __restrict__ frag_attrs,    // [num_frags, 4]
     const float* __restrict__ frag_alpha,    // [num_frags]
-    float* __restrict__ grad_frag_alpha      // [num_frags]
+    float* __restrict__ grad_frag_alpha,     // [num_frags]
+    cudaStream_t stream
 );
 
 } // namespace cuda

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cuda_runtime.h>
 
 namespace diffsoup {
 
@@ -28,7 +29,8 @@ void multires_triangle_alpha(
     const uint32_t min_level,
     const uint32_t max_level,
     const float* alpha_src,                 // [T, S], where T is triangle count and S = Σ (2^(level - 1) + 1) * (2^level + 1)
-    float* __restrict__ frag_alpha          // [num_frags]
+    float* __restrict__ frag_alpha,         // [num_frags]
+    cudaStream_t stream
 );
 
 void backward_multires_triangle_alpha(
@@ -37,7 +39,8 @@ void backward_multires_triangle_alpha(
     const uint32_t min_level,
     const uint32_t max_level,
     float* grad_alpha_src,                      // [T, S], where T is triangle count and S = Σ (2^(level - 1) + 1) * (2^level + 1)
-    const float* __restrict__ grad_frag_alpha   // [num_frags]
+    const float* __restrict__ grad_frag_alpha,  // [num_frags]
+    cudaStream_t stream
 );
 
 void multires_triangle_color(
@@ -47,7 +50,8 @@ void multires_triangle_color(
     const uint32_t max_level,
     const uint32_t feature_dim,
     const float* features,                   // [B, S, feature_dim]
-    float* out                               // [B, H, W, feature_dim]
+    float* out,                              // [B, H, W, feature_dim]
+    cudaStream_t stream
 );
 
 void backward_multires_triangle_color(
@@ -57,7 +61,17 @@ void backward_multires_triangle_color(
     const uint32_t max_level,
     const uint32_t feature_dim,
     float* grad_features,                // [T, S, feature_dim], where T is triangle count and S = Σ (2^(level - 1) + 1) * (2^level + 1)
-    const float* __restrict__ grad_out   // [B, H, W, feature_dim]
+    const float* __restrict__ grad_out,  // [B, H, W, feature_dim]
+    cudaStream_t stream
+);
+
+void build_accumulation_plan(
+    const uint32_t min_level,
+    const uint32_t max_level,
+    const uint32_t target_level,
+    int* __restrict__ plan_indices,           // [S_target, num_levels, 3]
+    float* __restrict__ plan_weights,          // [S_target, num_levels, 3]
+    cudaStream_t stream
 );
 
 void accumulate_to_level_forward(
@@ -67,7 +81,10 @@ void accumulate_to_level_forward(
     const uint32_t target_level,             // ≤ max_level
     const uint32_t feature_dim,
     const float* __restrict__ features,      // [T, Σ_{l=min..concat} S_l, C]
-    float* __restrict__ f_target             // [T, feats_at_level(target_level), C]
+    const int* __restrict__ plan_indices,
+    const float* __restrict__ plan_weights,
+    float* __restrict__ f_target,            // [T, feats_at_level(target_level), C]
+    cudaStream_t stream
 );
 
 void accumulate_to_level_backward(
@@ -77,7 +94,10 @@ void accumulate_to_level_backward(
     const uint32_t target_level,             // ≤ max_level
     const uint32_t feature_dim,
     float* __restrict__ grad_features,       // [T, Σ_{l=min..concat} S_l, C]  (zero before call)
-    const float* __restrict__ grad_f_target  // [T, feats_at_level(target_level), C]
+    const float* __restrict__ grad_f_target, // [T, feats_at_level(target_level), C]
+    const int* __restrict__ plan_indices,
+    const float* __restrict__ plan_weights,
+    cudaStream_t stream
 );
 
 } // namespace cuda

@@ -355,8 +355,9 @@ def main():
         alpha_acc = ds.accumulate_to_level(Rmin, Rmax, alpha_src).sigmoid()
         feat_acc = ds.accumulate_to_level(Rmin, Rmax, feat_src).sigmoid()
 
-        rast_out = ds.rasterize_multires_triangle_alpha(
+        rast_out, fragments = ds.rasterize_multires_triangle_alpha(
             (H, W), clip_verts, faces, level=Rmax, alpha_src=alpha_acc,
+            return_fragments=True,
         )
         feat = ds.multires_triangle_color(
             rast_out, level=Rmax, feat=feat_acc,
@@ -370,8 +371,9 @@ def main():
         # Opacity auxiliary loss (zero-valued; hooks gradient into alpha_src)
         aux_loss = ds.opacity_aux_loss(
             color.detach(), batch_gt, rast_out, clip_verts, faces,
-            level=Rmax, alpha_src=alpha_acc,
+            level=Rmax, alpha_src=alpha_acc, fragments=fragments,
         )
+        del fragments
         color = ds.edge_grad(color, rast_out, clip_verts, faces)
         l1_loss = (batch_gt - color).abs().mean()
         ssim_loss = 0.5 * (1 - ssim(

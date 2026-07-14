@@ -100,7 +100,13 @@ __global__ void encode_view_dir_sh2_kernel(
     const unsigned int x = (idx % (H * W)) % W;
 
     const int tri_id = static_cast<int>(rast[idx * 4 + 3]) - 1;
-    if (tri_id < 0) return;
+    if (tri_id < 0) {
+        #pragma unroll
+        for (int i = 0; i < 9; ++i) {
+            encoding[idx * 9 + i] = 0.f;
+        }
+        return;
+    }
 
     const float ndc_x = -1.f + 2.f * (static_cast<float>(x) + 0.5f) / static_cast<float>(W);
     const float ndc_y = -1.f + 2.f * (static_cast<float>(y) + 0.5f) / static_cast<float>(H);
@@ -121,9 +127,10 @@ void encode_view_dir_sh2(
     int B, int H, int W,
     const float* __restrict__ rast, // [B, H, W, 4]
     const float* inv_mvp,           // [B, 4, 4]
-    float* __restrict__ encoding    // [B, H, W, 9]
+    float* __restrict__ encoding,   // [B, H, W, 9]
+    cudaStream_t stream
 ) {
-    encode_view_dir_sh2_kernel<<<CUDA_BLOCKS(B * H * W), CUDA_THREADS>>>(
+    encode_view_dir_sh2_kernel<<<CUDA_BLOCKS(B * H * W), CUDA_THREADS, 0, stream>>>(
         B, H, W, rast, inv_mvp, encoding
     );
     CUDA_CHECK(cudaGetLastError());

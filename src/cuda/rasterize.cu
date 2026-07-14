@@ -3,6 +3,7 @@
 
 #include <thrust/device_ptr.h>
 #include <thrust/scan.h>
+#include <thrust/system/cuda/execution_policy.h>
 
 namespace diffsoup {
 namespace cuda {
@@ -141,28 +142,31 @@ int compute_triangle_rects(
     int V, const float* pos,     // [B * V][4]
     int T, const int* tri,       // [T][3]
     int* triangle_rects,         // [B * T][4]: h0, h_len, w0, w_len
-    int* frag_prefix_sum         // [B * T]
+    int* frag_prefix_sum,        // [B * T]
+    cudaStream_t stream
 ) {
     const int total = B * T;
     if (total == 0) return 0;
 
-    int* frag_counts = nullptr;
-    CUDA_CHECK(cudaMalloc(&frag_counts, sizeof(int) * total));
-
-    compute_triangle_rects_kernel<<<CUDA_BLOCKS(total), CUDA_THREADS>>>(
-        H, W, B, V, pos, T, tri, triangle_rects, frag_counts
+    // The prefix buffer first holds counts and is then scanned in place.
+    compute_triangle_rects_kernel<<<CUDA_BLOCKS(total), CUDA_THREADS, 0, stream>>>(
+        H, W, B, V, pos, T, tri, triangle_rects, frag_prefix_sum
     );
 
-    // Use Thrust for prefix sum on raw CUDA memory
+    // Use the caller's current stream for both the scan and the scalar copy.
     thrust::inclusive_scan(
-        thrust::device_pointer_cast(frag_counts),
-        thrust::device_pointer_cast(frag_counts + total),
+        thrust::cuda::par.on(stream),
+        thrust::device_pointer_cast(frag_prefix_sum),
+        thrust::device_pointer_cast(frag_prefix_sum + total),
         thrust::device_pointer_cast(frag_prefix_sum)
     );
 
     int num_frags = 0;
-    CUDA_CHECK(cudaMemcpy(&num_frags, frag_prefix_sum + (total - 1), sizeof(int), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaFree(frag_counts));
+    CUDA_CHECK(cudaMemcpyAsync(
+        &num_frags, frag_prefix_sum + (total - 1), sizeof(int),
+        cudaMemcpyDeviceToHost, stream
+    ));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaGetLastError());
     return num_frags;
 }
@@ -218,6 +222,10 @@ __global__ void compute_fragments_kernel(
 ) {
     const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_frags) return;
+
+    // Mark invalid candidates in the producer kernel, avoiding a separate
+    // torch.full() over the much larger three-column candidate buffer.
+    frag_pix[idx * 3 + 0] = -1;
 
     // Binary search to find triangle index
     int lo = 0, hi = num_tris;
@@ -285,11 +293,12 @@ void compute_fragments(
     const int* frag_prefix_sum,
     const int* triangle_rects,
     int* frag_pix,
-    float* frag_attrs
+    float* frag_attrs,
+    cudaStream_t stream
 ) {
     if (num_frags == 0) return;
 
-    compute_fragments_kernel<<<CUDA_BLOCKS(num_frags), CUDA_THREADS>>>(
+    compute_fragments_kernel<<<CUDA_BLOCKS(num_frags), CUDA_THREADS, 0, stream>>>(
         H, W,
         V, pos,
         T, tri,
@@ -356,11 +365,9 @@ __global__ void gather_depth_test_kernel(
     const long long packed = frag_index[idx];
     const int i_frag = unpack_index(packed);
 
-    if (i_frag < 0) return;
-
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        rast_out[idx * 4 + i] = frag_attrs[i_frag * 4 + i];
+        rast_out[idx * 4 + i] = i_frag < 0 ? 0.f : frag_attrs[i_frag * 4 + i];
     }
 }
 
@@ -376,26 +383,30 @@ void depth_test(
     const float* frag_attrs,   // [num_frags, 4]
     const float* frag_alpha,   // [num_frags]
     const float* alpha_thresh, // [num_frags]
-    float* rast_out            // [B, H, W, 4]
+    long long* frag_index,     // [B, H, W] workspace
+    float* rast_out,           // [B, H, W, 4]
+    cudaStream_t stream
 ) {
-    if (num_frags == 0) return;
-
     const int total = B * H * W;
+    if (total == 0) return;
+    if (num_frags == 0) {
+        CUDA_CHECK(cudaMemsetAsync(
+            rast_out, 0, static_cast<size_t>(total) * 4u * sizeof(float), stream
+        ));
+        return;
+    }
 
-    long long* frag_index = nullptr;
-    CUDA_CHECK(cudaMalloc(&frag_index, sizeof(long long) * total));
-    fill_ll_max<<<CUDA_BLOCKS(total), CUDA_THREADS>>>(frag_index, total);
+    fill_ll_max<<<CUDA_BLOCKS(total), CUDA_THREADS, 0, stream>>>(frag_index, total);
 
-    depth_test_kernel<<<CUDA_BLOCKS(num_frags), CUDA_THREADS>>>(
+    depth_test_kernel<<<CUDA_BLOCKS(num_frags), CUDA_THREADS, 0, stream>>>(
         H, W, num_frags, frag_pix, frag_attrs,
         frag_alpha, alpha_thresh, frag_index
     );
 
-    gather_depth_test_kernel<<<CUDA_BLOCKS(total), CUDA_THREADS>>>(
+    gather_depth_test_kernel<<<CUDA_BLOCKS(total), CUDA_THREADS, 0, stream>>>(
         B, H, W, frag_index, frag_attrs, rast_out
     );
 
-    CUDA_CHECK(cudaFree(frag_index));
     CUDA_CHECK(cudaGetLastError()); // catch kernel errors
 }
 
@@ -455,23 +466,58 @@ __global__ void filter_valid_fragments_kernel(
     }
 }
 
-int filter_valid_fragments(
+__global__ void count_valid_fragments_kernel(
     int num_frags,
-    const int* frag_pix,         // [num_frags, 3]
-    const float* frag_attrs,     // [num_frags, 4]
-    int* frag_pix_out,           // [num_frags, 3]
-    float* frag_attrs_out        // [num_frags, 4]
+    const int* __restrict__ frag_pix,
+    int* __restrict__ global_counter
+) {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const bool valid = idx < num_frags && frag_pix[idx * 3] >= 0;
+    const unsigned int active = __activemask();
+    const unsigned int valid_mask = __ballot_sync(active, valid);
+    if ((threadIdx.x & 31) == 0) {
+        atomicAdd(global_counter, __popc(valid_mask));
+    }
+}
+
+int count_valid_fragments(
+    int num_frags,
+    const int* frag_pix,
+    int* global_counter,
+    cudaStream_t stream
 ) {
     int valid_count = 0;
     if (num_frags == 0) return valid_count;
 
-    int* global_counter = nullptr;
-    CUDA_CHECK(cudaMalloc(&global_counter, sizeof(int)));
-    CUDA_CHECK(cudaMemset(global_counter, 0, sizeof(int)));
+    CUDA_CHECK(cudaMemsetAsync(global_counter, 0, sizeof(int), stream));
+    count_valid_fragments_kernel<<<CUDA_BLOCKS(num_frags), CUDA_THREADS, 0, stream>>>(
+        num_frags, frag_pix, global_counter
+    );
+    CUDA_CHECK(cudaMemcpyAsync(
+        &valid_count, global_counter, sizeof(int),
+        cudaMemcpyDeviceToHost, stream
+    ));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaGetLastError());
+    return valid_count;
+}
+
+void compact_valid_fragments(
+    int num_frags,
+    const int* frag_pix,         // [num_frags, 3]
+    const float* frag_attrs,     // [num_frags, 4]
+    int* frag_pix_out,           // [num_frags, 3]
+    float* frag_attrs_out,       // [num_frags, 4]
+    int* global_counter,         // [1] workspace
+    cudaStream_t stream
+) {
+    if (num_frags == 0) return;
+
+    CUDA_CHECK(cudaMemsetAsync(global_counter, 0, sizeof(int), stream));
 
     const size_t shared_mem = sizeof(int) * (CUDA_THREADS + 1);
 
-    filter_valid_fragments_kernel<<<CUDA_BLOCKS(num_frags), CUDA_THREADS, shared_mem>>>(
+    filter_valid_fragments_kernel<<<CUDA_BLOCKS(num_frags), CUDA_THREADS, shared_mem, stream>>>(
         num_frags,
         frag_pix,
         frag_attrs,
@@ -480,10 +526,7 @@ int filter_valid_fragments(
         global_counter
     );
 
-    CUDA_CHECK(cudaMemcpy(&valid_count, global_counter, sizeof(int), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaFree(global_counter));
     CUDA_CHECK(cudaGetLastError()); // catch kernel errors
-    return valid_count;
 }
 
 // CUDA device function: tests intersection between segments (1–2) and (3–4)
@@ -910,9 +953,10 @@ void backward_edge_grad(
     int V,
     const float* __restrict__ pos,           // [B, V, 4]
     float* __restrict__ grad_pos,            // [B, V, 4]
-    const int* __restrict__ tri              // [T, 3]
+    const int* __restrict__ tri,             // [T, 3]
+    cudaStream_t stream
 ) {
-    edge_grad_kernel<<<CUDA_BLOCKS(B * H * W), CUDA_THREADS>>>(
+    edge_grad_kernel<<<CUDA_BLOCKS(B * H * W), CUDA_THREADS, 0, stream>>>(
         B, H, W, C, color, grad_color, rast,
         V, pos, grad_pos, tri
     );
@@ -933,6 +977,8 @@ __global__ void backward_opacity_aux_loss_kernel(
 ) {
     const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_frags) return;
+
+    grad_frag_alpha[idx] = 0.f;
 
     const int batch = frag_pix[idx * 3 + 0];
     const int y = frag_pix[idx * 3 + 1];
@@ -963,10 +1009,10 @@ __global__ void backward_opacity_aux_loss_kernel(
     const float alpha = frag_alpha[idx];
 
     if (triangle_pixel >= 0 && triangle_frag == triangle_pixel) {
-        grad_frag_alpha[idx] += loss / MAX(alpha, eps);
+        grad_frag_alpha[idx] = loss / MAX(alpha, eps);
     }
     else {
-        grad_frag_alpha[idx] -= loss / MAX(1.f - alpha, eps);
+        grad_frag_alpha[idx] = -loss / MAX(1.f - alpha, eps);
     }
 }
 
@@ -979,11 +1025,12 @@ void backward_opacity_aux_loss(
     const int* __restrict__ frag_pix,        // [num_frags, 3]
     const float* __restrict__ frag_attrs,    // [num_frags, 4]
     const float* __restrict__ frag_alpha,    // [num_frags]
-    float* __restrict__ grad_frag_alpha      // [num_frags]
+    float* __restrict__ grad_frag_alpha,     // [num_frags]
+    cudaStream_t stream
 ) {
     if (num_frags == 0) return;
 
-    backward_opacity_aux_loss_kernel<<<CUDA_BLOCKS(num_frags), CUDA_THREADS>>>(
+    backward_opacity_aux_loss_kernel<<<CUDA_BLOCKS(num_frags), CUDA_THREADS, 0, stream>>>(
         B, H, W, C, color, target, rast, num_frags, frag_pix, frag_attrs,
         frag_alpha, grad_frag_alpha
     );
