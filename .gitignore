@@ -211,3 +211,8 @@ datasets/
 results/
 web/data/
 **.DS_Store
+
+.vscode/
+datasets/
+
+tests/

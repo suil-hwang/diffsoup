@@ -313,6 +313,11 @@ def main(
             ])
             optimizer_vert = ds.optimize.VectorAdam(params=[V_single], lr=old_lr_vert)
 
+            # Resampling briefly allocates buffers close to the VRAM limit at
+            # Rmax=5. Release those cached blocks before the next iteration so
+            # WDDM does not page subsequent training allocations.
+            torch.cuda.empty_cache()
+
     torch.cuda.empty_cache()
 
     # ── Final renders ────────────────────────────────────────────────

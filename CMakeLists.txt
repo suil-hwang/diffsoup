@@ -57,6 +57,12 @@ target_include_directories(_core PRIVATE
     ${CUDAToolkit_INCLUDE_DIRS}
 )
 
+if(MSVC)
+    target_compile_definitions(_core PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:__restrict__=__restrict>
+    )
+endif()
+
 # Optional but common for CUDA-heavy projects
 set_target_properties(_core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
