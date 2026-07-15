@@ -218,3 +218,7 @@ datasets/
 tests/
 /tests/
 /tests/**
+
+paper/
+tmp/
+.claude/

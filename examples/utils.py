@@ -12,6 +12,24 @@ import torch
 import imageio.v3 as iio
 import torchvision.transforms.functional as TF
 
+try:
+    from fused_ssim import fused_ssim as _fused_ssim
+except ImportError:
+    from pytorch_msssim import ssim as _pytorch_ssim
+
+    SSIM_BACKEND = "pytorch_msssim"
+
+    def ssim(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Compute valid-window SSIM with the reference backend."""
+        return _pytorch_ssim(prediction, target, data_range=1.0)
+else:
+    SSIM_BACKEND = "fused_ssim"
+
+    def ssim(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Compute valid-window SSIM with the fused backend."""
+        train = prediction.requires_grad and torch.is_grad_enabled()
+        return _fused_ssim(prediction, target, padding="valid", train=train)
+
 
 # =====================================================================
 #  COLMAP points3D reader

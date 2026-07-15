@@ -25,7 +25,7 @@ Recent advances in radiance field reconstruction, such as 3D Gaussian splatting,
 Clone this repository and create a virtual environment:
 
 ```bash
-git clone https://github.com/kenji-tojo/diffsoup.git
+git clone --recursive https://github.com/kenji-tojo/diffsoup.git
 cd diffsoup
 python3 -m venv venv
 source venv/bin/activate
@@ -48,6 +48,18 @@ Install the remaining dependencies:
 ```bash
 pip3 install -r requirements.txt
 ```
+
+Build and install the fused SSIM extension:
+
+```bash
+git submodule update --init --recursive
+pip3 install --no-build-isolation ./submodules/fused-ssim
+```
+
+The training scripts use `fused_ssim` automatically when it is importable and
+fall back to `pytorch_msssim` otherwise. There is no runtime backend flag. On
+Windows, run the extension build from an x64 Visual Studio developer prompt so
+`cl.exe` is available.
 
 ## Datasets
 

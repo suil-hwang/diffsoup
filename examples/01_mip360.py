@@ -23,12 +23,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 import open3d as o3d
 import torch
-from pytorch_msssim import ssim
 from torch.optim import Adam
 from tqdm.auto import tqdm
 
 import diffsoup as ds
 from utils import (
+    SSIM_BACKEND,
+    ssim,
     load_mipnerf360_scene,
     mvp_from_K_Tcw,
     read_points3D,
@@ -61,6 +62,7 @@ def main(
     out_dir: Optional[str] = None,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[ssim] backend={SSIM_BACKEND}")
     scene_name = os.path.basename(os.path.normpath(scene_root))
     if out_dir is None:
         out_dir = os.path.join("./results/01_mip360", scene_name)
@@ -230,7 +232,7 @@ def main(
         color = ds.edge_grad(color, rast_out, V_clip, F)
         l1_loss = (batch_gt_rgb - color).abs().mean()
         ssim_loss = 0.5 * (1 - ssim(
-            batch_gt_rgb.permute(0, 3, 1, 2), color.permute(0, 3, 1, 2), data_range=1.0,
+            color.permute(0, 3, 1, 2), batch_gt_rgb.permute(0, 3, 1, 2),
         ))
         loss = aux_loss + 0.8 * l1_loss + 0.2 * ssim_loss
 
@@ -419,7 +421,7 @@ def main(
             psnrs.append(float(psnr_fn(pred_lin, gt_lin).item()))
             pred_nchw = pred_lin.permute(2, 0, 1).unsqueeze(0)
             gt_nchw = gt_lin.permute(2, 0, 1).unsqueeze(0)
-            ssims.append(float(ssim(gt_nchw, pred_nchw, data_range=1.0).item()))
+            ssims.append(float(ssim(pred_nchw, gt_nchw).item()))
 
             stem = os.path.splitext(os.path.basename(fr["img_path"]))[0]
             iio.imwrite(

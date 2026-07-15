@@ -36,13 +36,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from PIL import Image
-from pytorch_msssim import ssim
 from skimage.metrics import structural_similarity as sk_ssim
 from torch.optim import Adam
 from tqdm import tqdm
 
 import diffsoup as ds
 from utils import (
+    SSIM_BACKEND,
+    ssim,
     project_vertices,
     exp_decay_mult,
     count_visible_triangles,
@@ -224,6 +225,7 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     device = torch.device("cuda")
+    print(f"[ssim] backend={SSIM_BACKEND}")
 
     # ── Load mesh ────────────────────────────────────────────────────
 
@@ -377,7 +379,7 @@ def main():
         color = ds.edge_grad(color, rast_out, clip_verts, faces)
         l1_loss = (batch_gt - color).abs().mean()
         ssim_loss = 0.5 * (1 - ssim(
-            batch_gt.permute(0, 3, 1, 2), color.permute(0, 3, 1, 2), data_range=1.0,
+            color.permute(0, 3, 1, 2), batch_gt.permute(0, 3, 1, 2),
         ))
         loss = aux_loss + 0.8 * l1_loss + 0.2 * ssim_loss
 
