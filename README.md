@@ -61,6 +61,27 @@ fall back to `pytorch_msssim` otherwise. There is no runtime backend flag. On
 Windows, run the extension build from an x64 Visual Studio developer prompt so
 `cl.exe` is available.
 
+### Optional ARAG geometry priors
+
+The recursive submodule checkout installs the pinned ARAG source under
+`submodules/arag`. Download `ckpt_promask_best.pth` separately and place it at
+the upstream-standard location:
+
+```text
+submodules/arag/work_dir/ckpts/ckpt_promask_best.pth
+```
+
+The checkpoint is intentionally not tracked. With this default location, a
+complete MipNeRF-360 scene prior can be generated without passing ARAG paths:
+
+```bash
+python examples/08_prepare_geometry_priors.py \
+    --scene-root ./datasets/360_v2/garden
+```
+
+The command buffers coarse predictions in CPU memory and writes only `depth/`,
+`normals_4/`, and `sparse/0/depth_params.json` inside the scene.
+
 ## Datasets
 
 ### Multi-View Datasets

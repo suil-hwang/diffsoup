@@ -222,3 +222,5 @@ tests/
 paper/
 tmp/
 .claude/
+.serena/
+.agents/

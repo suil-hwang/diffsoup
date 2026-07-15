@@ -38,3 +38,17 @@ from .point3d import (
     triangle_soup_from_points,
     remove_unreferenced_vertices_from_soup,
 )
+
+from .surface import (
+    VertexExpectedSurfaceSamples,
+    vertex_expected_surface_samples,
+)
+
+from .regularization import (
+    inverse_depth_prior_loss,
+    normal_prior_loss,
+)
+
+from .priors import (
+    GeometryPriorStore,
+)

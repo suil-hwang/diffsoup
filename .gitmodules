@@ -4,3 +4,7 @@
 [submodule "submodules/nvdiffrast"]
 	path = submodules/nvdiffrast
 	url = https://github.com/NVlabs/nvdiffrast.git
+[submodule "submodules/arag"]
+	path = submodules/arag
+	url = https://github.com/Dreamaker-MrC/Any-Resolution-Any-Geometry.git
+	ignore = untracked

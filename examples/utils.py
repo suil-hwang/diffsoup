@@ -110,7 +110,10 @@ def opengl_P_from_K(
     P[0, 0] = 2.0 * fx / W
     P[1, 1] = 2.0 * fy / H
     P[0, 2] = 1.0 - 2.0 * (cx / W)
-    P[1, 2] = 2.0 * (cy / H) - 1.0
+    # The CUDA rasterizer maps increasing NDC Y to increasing image row Y.
+    # With the Z-flipped OpenGL view, this sign reproduces v = fy*y/z + cy
+    # for non-centred principal points as well as the common cy = H/2 case.
+    P[1, 2] = 1.0 - 2.0 * (cy / H)
     P[2, 2] = (z_far + z_near) / (z_near - z_far)
     P[2, 3] = (2.0 * z_far * z_near) / (z_near - z_far)
     P[3, 2] = -1.0
