@@ -188,41 +188,64 @@ class ColorMLP(nn.Module):
 
     # -- forward ------------------------------------------------------------
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        extra_features: torch.Tensor | None = None,
+    ):
         """
         Args:
-            x:    ``(B, H, W, input_dim)`` — concatenated rasterised features.
+            x:    ``(B, H, W, C)`` — rasterised features. ``C`` equals
+                  ``input_dim`` unless ``extra_features`` is provided.
             mask: Optional ``(B, H, W)`` bool mask.  When provided, the MLP
                   is evaluated only at ``True`` pixels.
+            extra_features: Optional ``(B, H, W, C_extra)`` tensor appended
+                  to ``x``.  With a mask, both inputs are gathered before
+                  concatenation so a full-image combined tensor is avoided.
 
         Returns:
             ``(B, H, W, output_dim)`` blended output.
         """
-        B, H, W, _ = x.shape
-        assert x.shape == (B, H, W, self.input_dim)
+        B, H, W, input_dim = x.shape
+        if extra_features is None:
+            assert input_dim == self.input_dim
+        else:
+            assert extra_features.shape[:3] == (B, H, W)
+            assert input_dim + extra_features.shape[-1] == self.input_dim
+            assert extra_features.device == x.device
+            assert extra_features.dtype == x.dtype
         assert mask is None or mask.shape == (B, H, W)
 
         rgb = x[..., :3]
         res = x[..., 3:4]
 
         if mask is not None:
-            x_flat = x.view(-1, self.input_dim)
+            x_flat = x.view(-1, input_dim)
             mask_flat = mask.view(-1)
 
             output_flat = torch.zeros(
                 B * H * W, self.output_dim, device=x.device, dtype=x.dtype
             )
-            if mask_flat.any():
-                valid_input = x_flat[mask_flat]
-                valid_output = self.mlp(valid_input)
+            valid_base = x_flat[mask_flat]
+            if extra_features is None:
+                valid_input = valid_base
+            else:
+                valid_extra = extra_features.view(
+                    -1, extra_features.shape[-1]
+                )[mask_flat]
+                valid_input = torch.cat([valid_base, valid_extra], dim=-1)
 
-                valid_rgb = rgb[mask]
-                valid_res = res[mask]
-                valid_output = (1.0 - valid_res) * valid_rgb + valid_res * valid_output
-                output_flat[mask_flat] = valid_output
+            valid_output = self.mlp(valid_input)
+            valid_rgb = valid_base[:, :3]
+            valid_res = valid_base[:, 3:4]
+            valid_output = (1.0 - valid_res) * valid_rgb + valid_res * valid_output
+            output_flat[mask_flat] = valid_output
 
             return output_flat.view(B, H, W, self.output_dim)
 
+        if extra_features is not None:
+            x = torch.cat([x, extra_features], dim=-1)
         y = self.mlp(x.view(-1, self.input_dim)).view(B, H, W, self.output_dim)
         return (1.0 - res) * rgb + res * y
 

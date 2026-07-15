@@ -129,6 +129,11 @@ def main(
     ], dim=0)
     MVPs_inv = torch.inverse(MVPs).contiguous()
 
+    # ``gt_rgb`` owns the stacked images; retaining the per-frame tensors
+    # keeps a second full copy of the training set resident on the GPU.
+    del frames, train_data
+    torch.cuda.empty_cache()
+
     # ── Colour MLP ───────────────────────────────────────────────────
 
     color_mlp = ds.ColorMLP(
@@ -156,8 +161,10 @@ def main(
                 rast_out, level=Rmax,
                 feat=ds.accumulate_to_level(Rmin, Rmax, feat_src).sigmoid(),
             ).view(-1, H, W, feat_dim)
-            feat = torch.cat([feat, ds.encode_view_dir_sh2(rast_out, eval_MVP_inv[view_idx : view_idx + 1])], dim=-1)
-            color = color_mlp.forward(feat, mask=rast_out[..., -1] > 0).view(1, H, W, 3)
+            view_feat = ds.encode_view_dir_sh2(rast_out, eval_MVP_inv[view_idx : view_idx + 1])
+            color = color_mlp.forward(
+                feat, mask=rast_out[..., -1] > 0, extra_features=view_feat,
+            ).view(1, H, W, 3)
             pred_init.append(color.squeeze(0))
         pred_init = torch.stack(pred_init, dim=0)
     for j in range(pred_init.shape[0]):
@@ -165,6 +172,7 @@ def main(
             os.path.join(out_dir, f"initial_pred_{j}.png"),
             (pred_init[j].clamp(0, 1).cpu().numpy() * 255).astype(np.uint8),
         )
+    del pred_init, color, feat, view_feat, rast_out, V_clip
     print(f"[save] initial renders → {out_dir}/initial_pred_*.png")
 
     # ── Optimisers ───────────────────────────────────────────────────
@@ -220,8 +228,10 @@ def main(
         feat = ds.multires_triangle_color(
             rast_out, level=Rmax, feat=feat_acc,
         ).view(-1, H, W, feat_dim)
-        feat = torch.cat([feat, ds.encode_view_dir_sh2(rast_out, batch_MVP_inv)], dim=-1)
-        color = color_mlp.forward(feat, mask=rast_out[..., -1] > 0).view(-1, H, W, 3)
+        view_feat = ds.encode_view_dir_sh2(rast_out, batch_MVP_inv)
+        color = color_mlp.forward(
+            feat, mask=rast_out[..., -1] > 0, extra_features=view_feat,
+        ).view(-1, H, W, 3)
 
         # Opacity auxiliary loss (zero-valued; hooks gradient into alpha_src)
         aux_loss = ds.opacity_aux_loss(
@@ -236,20 +246,35 @@ def main(
         ))
         loss = aux_loss + 0.8 * l1_loss + 0.2 * ssim_loss
 
-        optimizer_soup.zero_grad(set_to_none=True)
-        optimizer_vert.zero_grad(set_to_none=True)
-        optimizer_shader.zero_grad(set_to_none=True)
         loss.backward()
         optimizer_soup.step()
         optimizer_vert.step()
         optimizer_shader.step()
 
+        # Gradients are not used after the update.  Releasing them here keeps
+        # the large post-lift source gradients out of the next forward pass
+        # and, most importantly, out of lift/resampling allocations.
+        optimizer_soup.zero_grad(set_to_none=True)
+        optimizer_vert.zero_grad(set_to_none=True)
+        optimizer_shader.zero_grad(set_to_none=True)
+
         l = float(loss.detach().item())
         losses.append(l)
         pbar.set_postfix(loss=f"{l:.6f}")
 
+        # Python function scope otherwise retains these outputs until the next
+        # assignment, overlapping them with topology-changing allocations.
+        del batch_MVP, batch_MVP_inv, batch_gt_rgb
+        del V_clip, alpha_acc, feat_acc, rast_out, feat, view_feat, color
+        del aux_loss, l1_loss, ssim_loss, loss
+
         # ── Lift multi-resolution levels at step 5 000 ───────────────
         if i_iter == 5_000 and i_iter < steps:
+            old_lr_feat = optimizer_soup.param_groups[0]["lr"]
+            old_lr_alpha = optimizer_soup.param_groups[1]["lr"]
+            old_lr_vert = optimizer_vert.param_groups[0]["lr"]
+            del optimizer_soup, optimizer_vert
+
             with torch.no_grad():
                 feat_src_lifted = ds.accumulate_to_level(0, 0, feat_src, target_level=2)
                 Rmin, Rmax = 2, 5
@@ -265,10 +290,7 @@ def main(
 
             feat_src.requires_grad = True
             alpha_src.requires_grad = True
-
-            old_lr_feat = optimizer_soup.param_groups[0]["lr"]
-            old_lr_alpha = optimizer_soup.param_groups[1]["lr"]
-            old_lr_vert = optimizer_vert.param_groups[0]["lr"]
+            del feat_src_lifted, new_feat_src
 
             optimizer_soup = Adam([
                 {"params": [feat_src], "lr": old_lr_feat},
@@ -278,9 +300,22 @@ def main(
 
         # ── Resample soup ────────────────────────────────────────────
         if i_iter % 100 == 0 and i_iter < 9_550:
+            old_lr_feat = optimizer_soup.param_groups[0]["lr"]
+            old_lr_alpha = optimizer_soup.param_groups[1]["lr"]
+            old_lr_vert = optimizer_vert.param_groups[0]["lr"]
+            del optimizer_soup, optimizer_vert
+
             with torch.no_grad():
+                source_feat = feat_src
+                source_alpha = alpha_src
+                parent_map = torch.arange(F.shape[0], device=F.device)
+                alpha_acc = None
+                topology_changed = False
+
                 if F.shape[0] > 15_000:
-                    alpha_acc = ds.accumulate_to_level(Rmin, Rmax, alpha_src).sigmoid()
+                    alpha_acc = ds.accumulate_to_level(
+                        Rmin, Rmax, source_alpha,
+                    ).sigmoid()
                     tri_counts = count_visible_triangles(
                         (H // 2, W // 2), MVPs, V_single, F,
                         level=Rmax, alpha_src=alpha_acc, batch_size=1,
@@ -288,28 +323,34 @@ def main(
                     keep_map = build_keep_map(tri_counts, remove=F.shape[0] - 15_000)
                     F = F[keep_map]
                     V_single, F = ds.remove_unreferenced_vertices_from_soup(V_single, F)
-                    feat_src = ds.expand_by_index(feat_src, keep_map)
-                    alpha_src = ds.expand_by_index(alpha_src, keep_map)
+                    parent_map = parent_map[keep_map]
+                    alpha_acc = alpha_acc[keep_map]
+                    topology_changed = True
 
                 if i_iter < 9_500:
-                    alpha_acc = ds.accumulate_to_level(Rmin, Rmax, alpha_src).sigmoid()
+                    if alpha_acc is None:
+                        alpha_acc = ds.accumulate_to_level(
+                            Rmin, Rmax, source_alpha,
+                        ).sigmoid()
                     V_single, F, face_map = split_edges_from_training_views(
                         (H // 2, W // 2), MVPs, V_single, F,
                         Rmax, alpha_acc,
                         tau_ratio=1 / 5, num_views_cap=20,
                     )
-                    feat_src = ds.expand_by_index(feat_src, face_map)
-                    alpha_src = ds.expand_by_index(alpha_src, face_map)
+                    parent_map = parent_map[face_map]
+                    topology_changed = True
+
+                if topology_changed:
+                    feat_src = ds.expand_by_index(source_feat, parent_map)
+                    alpha_src = ds.expand_by_index(source_alpha, parent_map)
+
+            del source_feat, source_alpha, parent_map, alpha_acc, topology_changed
 
             print(f"  [resample] verts={V_single.shape[0]:,}  faces={F.shape[0]:,}")
 
             V_single.requires_grad = True
             feat_src.requires_grad = True
             alpha_src.requires_grad = True
-
-            old_lr_feat = optimizer_soup.param_groups[0]["lr"]
-            old_lr_alpha = optimizer_soup.param_groups[1]["lr"]
-            old_lr_vert = optimizer_vert.param_groups[0]["lr"]
 
             optimizer_soup = Adam([
                 {"params": [feat_src], "lr": old_lr_feat},
@@ -339,8 +380,10 @@ def main(
                 rast_out, level=Rmax,
                 feat=ds.accumulate_to_level(Rmin, Rmax, feat_src).sigmoid(),
             ).view(-1, H, W, feat_dim)
-            feat = torch.cat([feat, ds.encode_view_dir_sh2(rast_out, eval_MVP_inv[j : j + 1])], dim=-1)
-            color = color_mlp.forward(feat, mask=rast_out[..., -1] > 0).view(1, H, W, 3)
+            view_feat = ds.encode_view_dir_sh2(rast_out, eval_MVP_inv[j : j + 1])
+            color = color_mlp.forward(
+                feat, mask=rast_out[..., -1] > 0, extra_features=view_feat,
+            ).view(1, H, W, 3)
             iio.imwrite(
                 os.path.join(out_dir, f"final_pred_{j}.png"),
                 (color.squeeze(0).clamp(0, 1).cpu().numpy() * 255).astype(np.uint8),
@@ -412,8 +455,10 @@ def main(
                 rast_out, level=Rmax,
                 feat=ds.accumulate_to_level(Rmin, Rmax, feat_src).sigmoid(),
             ).view(-1, H, W, feat_dim)
-            feat = torch.cat([feat, ds.encode_view_dir_sh2(rast_out, MVP_inv)], dim=-1)
-            color = color_mlp.forward(feat, mask=rast_out[..., -1] > 0).view(1, H, W, 3)
+            view_feat = ds.encode_view_dir_sh2(rast_out, MVP_inv)
+            color = color_mlp.forward(
+                feat, mask=rast_out[..., -1] > 0, extra_features=view_feat,
+            ).view(1, H, W, 3)
 
             pred_lin = color.squeeze(0).clamp(0, 1)
             gt_lin = fr["image"].clamp(0, 1)

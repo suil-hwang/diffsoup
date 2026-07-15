@@ -15,6 +15,13 @@ root `train.py` in this checkout. Use `01_mip360.py`, `02_synthetic.py`, and
 `07_extract_bench.py` cover native viewing, FPS benchmarking, Web export, and
 benchmark extraction.
 
+Shared example logic lives in `examples/utils.py`. In particular, its `ssim`
+adapter automatically uses the installed `fused_ssim` extension and falls back
+to `pytorch_msssim`; training entry points should import that adapter rather
+than duplicate backend logic or expose a runtime backend flag.
+`submodules/fused-ssim/` is a pinned Git submodule and builds as a separate
+PyTorch CUDA extension, not as part of the root scikit-build/CMake extension.
+
 There are three viewer surfaces:
 
 - `viewer/` is the separately built native C++ OpenGL package
@@ -38,6 +45,8 @@ environment's `python`; do not assume that `python3` resolves to it.
 
 ```bash
 python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+git submodule update --init --recursive
+python -m pip install --no-build-isolation ./submodules/fused-ssim
 python -m pip install -v .
 python -m pip install -r requirements.txt
 python examples/00_version.py
@@ -47,6 +56,15 @@ python examples/00_version.py
 through scikit-build-core. Rebuild after modifying `src/`, `CMakeLists.txt`, or
 native compile definitions. The default CMake CUDA architecture is 89; set
 `CMAKE_CUDA_ARCHITECTURES` explicitly when validating a different GPU target.
+Rebuild `submodules/fused-ssim` after changing its pinned commit or changing
+PyTorch, CUDA, the host compiler, or the target GPU architecture.
+
+On Windows, build `fused-ssim` from an x64 Visual Studio developer prompt. If
+localized `cl.exe` output triggers a `UnicodeDecodeError` in PyTorch's compiler
+probe, first confirm the selected MSVC toolchain is ABI-compatible. The
+validated Windows environment required `DISTUTILS_USE_SDK=1` and a temporary
+`TORCH_DONT_CHECK_COMPILER_ABI=1`; do not persist the ABI-check override as a
+general environment setting.
 
 Representative workflows are:
 
@@ -84,6 +102,14 @@ safe across shapes, devices, forward/backward calls, and non-default streams.
 Do not trade exact forward behavior or validated gradient tolerances for a
 timing improvement.
 
+Keep the shared SSIM contract unchanged: arguments are prediction first and
+target second, tensors are NCHW with values in `[0, 1]`, and fused execution
+uses `padding="valid"`. The fused implementation differentiates only its first
+argument, so reversing the inputs silently removes the prediction gradient.
+Keep `pytorch_msssim` as the automatic fallback with `data_range=1.0`; use
+`prediction.requires_grad` together with `torch.is_grad_enabled()` when
+deciding whether fused backward data is needed.
+
 GLSL files in `py_viewer/` target OpenGL 4.1 core. Preserve the geometry-pass
 MRT contract, alpha discard rule, and default color output when adding a debug
 mode. Checkpoint loading should keep `torch.load(..., weights_only=True)` unless
@@ -106,6 +132,7 @@ The current CUDA optimization regression file can be run with:
 ```bash
 python -m pytest -q -p no:cacheprovider tests/test_cuda_optimizations.py
 python -m compileall -q python py_viewer examples
+pyrefly check examples/utils.py examples/01_mip360.py examples/02_synthetic.py examples/03_random_init.py
 python examples/00_version.py
 ```
 
@@ -113,6 +140,13 @@ CUDA tests require a rebuilt extension and a real CUDA device. Kernel changes
 must cover representative levels, feature dimensions, empty geometry,
 forward/backward parity, reused auxiliary fragments/plans, and non-default
 streams. Synchronize only at measurement or assertion boundaries.
+
+SSIM changes require forward and prediction-gradient parity against
+`pytorch_msssim` with valid padding. Benchmark forward plus backward after
+warm-up with CUDA events and report peak allocated memory for garden-resolution
+B1, B2, and B4 inputs. Because Windows WDDM slowdown can appear only after the
+step-5,000 multiresolution lift, run garden B4 through at least step 5,400 in a
+separate ignored output directory before claiming long-run stability.
 
 For performance work, establish a correctness baseline first, warm up kernels,
 use CUDA events or explicit synchronization around the measured interval, and
@@ -139,3 +173,6 @@ list exact validation commands and hardware/CUDA/OpenGL details, and include
 metric deltas or screenshots for CUDA, viewer, Web, or rendering changes. Do
 not commit datasets, checkpoints, result images, benchmark dumps, build
 products, virtual environments, or generated Web data.
+When updating `fused-ssim`, commit the intended gitlink change together with
+any necessary `.gitmodules` change, verify `git submodule status`, and keep
+submodule `build/`, wheel, and egg-info artifacts untracked.

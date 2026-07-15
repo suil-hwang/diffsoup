@@ -16,9 +16,9 @@ Recent advances in radiance field reconstruction, such as 3D Gaussian splatting,
 ## Tested Environment
 
 - Ubuntu 22.04 LTS
-- Python 3.10
-- CUDA 12.4
-- NVIDIA RTX 4090
+- Python 3.11
+- CUDA 13.0
+- RTX 4070 Ti SUPER
 
 ## Installation
 

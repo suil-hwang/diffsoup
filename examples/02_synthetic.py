@@ -364,8 +364,10 @@ def main():
         feat = ds.multires_triangle_color(
             rast_out, level=Rmax, feat=feat_acc,
         ).view(-1, H, W, feat_dim)
-        feat = torch.cat([feat, ds.encode_view_dir_sh2(rast_out, batch_mvps_inv)], dim=-1)
-        color = color_mlp.forward(feat, mask=rast_out[..., -1] > 0).view(-1, H, W, 3)
+        view_feat = ds.encode_view_dir_sh2(rast_out, batch_mvps_inv)
+        color = color_mlp.forward(
+            feat, mask=rast_out[..., -1] > 0, extra_features=view_feat,
+        ).view(-1, H, W, 3)
 
         mask = (rast_out.detach()[..., -1:] > 0).float()
         color = mask * color + (1.0 - mask)
@@ -518,8 +520,10 @@ def main():
             feat = ds.multires_triangle_color(
                 rast_out, level=Rmax, feat=feat_acc,
             ).view(-1, test_H, test_W, feat_dim)
-            feat = torch.cat([feat, ds.encode_view_dir_sh2(rast_out, mvp_inv)], dim=-1)
-            color = color_mlp.forward(feat, mask=rast_out[..., -1] > 0).view(-1, test_H, test_W, 3)
+            view_feat = ds.encode_view_dir_sh2(rast_out, mvp_inv)
+            color = color_mlp.forward(
+                feat, mask=rast_out[..., -1] > 0, extra_features=view_feat,
+            ).view(-1, test_H, test_W, 3)
 
             mask = (rast_out.detach()[..., -1:] > 0).float()
             color = mask * color + (1.0 - mask)

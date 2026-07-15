@@ -1,4 +1,12 @@
 cmake_minimum_required(VERSION 3.20)
+
+# Set the project default before CUDA language initialisation.  Newer CMake
+# versions otherwise populate this variable with the compiler's oldest
+# supported architecture, causing the intended project default to be skipped.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 89)
+endif()
+
 project(diffsoup VERSION 0.1.0 LANGUAGES CXX CUDA)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -26,10 +34,6 @@ find_package(nanobind CONFIG REQUIRED)
 # ----------------------------------
 find_package(CUDAToolkit REQUIRED)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 89)
-endif()
 
 # ----------------------------------
 # Build nanobind module inside package
