@@ -73,7 +73,7 @@ def main(
     train_data = load_mipnerf360_scene(
         scene_root, split="train", downscale=downscale, device=device,
     )
-    K, H, W = train_data["K"], train_data["H"], train_data["W"]
+    K, Ks, H, W = train_data["K"], train_data["Ks"], train_data["H"], train_data["W"]
     frames = train_data["frames"]
     N_train = len(frames)
     print(f"[views] train={N_train}  folder={train_data['folder']} size={H}x{W}")
@@ -124,7 +124,7 @@ def main(
     z_near_train, z_near_test, z_far = 0.01, 0.5, 100.0
 
     MVPs = torch.stack([
-        mvp_from_K_Tcw(K, fr["Tcw"], (H, W), z_near=z_near_train, z_far=z_far, flip_z=flip_z)
+        mvp_from_K_Tcw(fr["K"], fr["Tcw"], (H, W), z_near=z_near_train, z_far=z_far, flip_z=flip_z)
         for fr in frames
     ], dim=0)
     MVPs_inv = torch.inverse(MVPs).contiguous()
@@ -417,6 +417,7 @@ def main(
         "Rmax": Rmax,
         "feat_dim": feat_dim,
         "K": K.detach().cpu(), "H": H, "W": W,
+        "Ks": Ks.detach().cpu(),
         "flip_z": flip_z,
         "steps": steps,
         "losses": losses,
@@ -440,7 +441,7 @@ def main(
     with torch.no_grad():
         for i, fr in enumerate(test_frames):
             MVP = mvp_from_K_Tcw(
-                K, fr["Tcw"], (H, W), z_near=z_near_test, z_far=z_far, flip_z=flip_z,
+                fr["K"], fr["Tcw"], (H, W), z_near=z_near_test, z_far=z_far, flip_z=flip_z,
             ).unsqueeze(0)
             MVP_inv = torch.inverse(MVP).contiguous()
             V_clip = project_vertices(V_single, MVP)

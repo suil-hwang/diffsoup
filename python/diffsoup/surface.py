@@ -19,6 +19,10 @@ class VertexExpectedSurfaceSamples(NamedTuple):
     valid: torch.Tensor
 
 
+# ---------------------------------------------------------------------------
+#  Live fragment geometry
+# ---------------------------------------------------------------------------
+
 def _fragment_live_geometry(
     vertices: torch.Tensor,
     faces: torch.Tensor,
@@ -29,7 +33,26 @@ def _fragment_live_geometry(
     eps: float,
     parallel_cos_eps: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Recompute camera-Z and camera normal for fixed fragment identities."""
+    """Recompute camera-Z and camera normal for fixed fragment identities.
+
+    ``camera_z = n · (p0 - C) / (n · d)`` intersects each detached pixel
+    ray ``d`` (unit camera-space z) with its live triangle plane; normals
+    are face-forwarded toward the camera, so winding does not matter.
+
+    Args:
+        vertices:     Live vertex positions ``(V, 3)``, floating.
+        faces:        Triangle indices ``(F, 3)``, integer.
+        triangle_ids: Zero-based raster triangle ids ``(N,)``.
+        pixels_b_y_x: Fragment pixels ``(N, 3)`` — ``(batch, y, x)``.
+        K:            Intrinsics ``(B, 3, 3)``.
+        Tcw:          World-to-camera transforms ``(B, 4, 4)``.
+        eps:          Degeneracy floor for normals and depth.
+        parallel_cos_eps: Minimum ray/plane ``|cos|`` before rejection.
+
+    Returns:
+        ``camera_z (N,)``, unit ``normal_camera (N, 3)``, and ``valid
+        (N,)`` bool; invalid entries are zeroed.
+    """
     # Clamp invalid IDs only for indexing; validity removes their contribution.
     triangle_valid = (triangle_ids >= 0) & (triangle_ids < faces.shape[0])
     safe_triangle_ids = triangle_ids.clamp(0, faces.shape[0] - 1)
@@ -107,6 +130,10 @@ def _fragment_live_geometry(
     return camera_z, normal_camera, valid
 
 
+# ---------------------------------------------------------------------------
+#  Fixed-opacity compositing
+# ---------------------------------------------------------------------------
+
 def _blend_expected_fragments(
     groups: torch.Tensor,
     sort_depth: torch.Tensor,
@@ -118,9 +145,23 @@ def _blend_expected_fragments(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Composite exact fixed-opacity expectations for sampled pixels.
 
-    Raster depth fixes visibility order. Invalid live geometry still consumes
-    its raster opacity, but its undefined depth and normal do not contribute.
-    The returned completeness mask rejects such partial expected maps.
+    Per group, in detached raster-depth order, fragments are weighted
+    ``w_i = α_i · Π_{j<i} (1 - α_j)`` exactly (``α = 1`` included);
+    invalid live geometry consumes visibility without contributing.
+
+    Args:
+        groups:         Pixel-group index per fragment ``(N,)``, int64.
+        sort_depth:     Detached raster depths ``(N,)`` fixing the order.
+        camera_z:       Live camera depths ``(N,)``.
+        normal_camera:  Live unit camera normals ``(N, 3)``.
+        alpha:          Fragment opacities ``(N,)``; detached, clamped.
+        geometry_valid: Usable live geometry ``(N,)`` bool.
+        unique_count:   Number of pixel groups ``G``.
+
+    Returns:
+        ``expected (G,)``, ``rendered_normal (G, 3)``, ``opacity (G,)``,
+        and ``complete (G,)`` — ``False`` where visibility leaked to
+        invalid fragments.
     """
     # Group pixels while preserving the renderer's detached depth order.
     depth_order = torch.argsort(sort_depth.detach(), stable=True)
@@ -182,6 +223,10 @@ def _blend_expected_fragments(
     return expected, rendered_normal, opacity, complete
 
 
+# ---------------------------------------------------------------------------
+#  Expected surface samples
+# ---------------------------------------------------------------------------
+
 def vertex_expected_surface_samples(
     vertices: torch.Tensor,
     faces: torch.Tensor,
@@ -198,8 +243,27 @@ def vertex_expected_surface_samples(
 ) -> VertexExpectedSurfaceSamples:
     """Evaluate sparse expected depth, normal, and opacity maps.
 
-    Fragment membership, raster ordering, opacity, pixels, and cameras are
-    detached. Only live ray-plane intersections and face normals differentiate.
+    Fragment membership, raster order, opacity, pixels, and cameras are
+    detached; only live ray-plane depths and face normals differentiate.
+
+    Args:
+        vertices:     Live vertex positions ``(V, 3)``, floating.
+        faces:        Triangle indices ``(F, 3)``, integer.
+        frag_pix:     Fragment pixels ``(N, 3)`` — ``(batch, y, x)``.
+        frag_attrs:   Fragment attributes ``(N, 4)`` —
+                      ``(bary0, bary1, z, triangle_id + 1)``.
+        frag_alpha:   Fragment opacities ``(N,)``, same dtype as vertices.
+        K:            Intrinsics ``(3, 3)`` shared or ``(B, 3, 3)``.
+        Tcw:          World-to-camera transforms ``(B, 4, 4)``.
+        pixels_b_y_x: Sampled pixels ``(S, 3)`` — ``(batch, y, x)``.
+        image_size:   ``(height, width)`` of the raster.
+        eps:          Degeneracy floor for depth and opacity.
+        parallel_cos_eps: Minimum ray/plane ``|cos|`` before rejection.
+
+    Returns:
+        :class:`VertexExpectedSurfaceSamples` with one row per sampled
+        pixel; invalid rows keep zero depth and normal with ``valid``
+        ``False``.
     """
     assert vertices.ndim == 2 and vertices.shape[-1] == 3
     assert faces.ndim == 2 and faces.shape[-1] == 3

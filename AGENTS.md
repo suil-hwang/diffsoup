@@ -21,7 +21,9 @@ viewing, native FPS benchmarking, Web export, and mobile-benchmark extraction.
 `examples/08_prepare_geometry_priors.py` prepares a complete scene-level ARAG
 depth/normal prior layout for `02_mip360_test.py`. Shared COLMAP/camera/data,
 SSIM, visibility, pruning, and screen-space splitting helpers live in
-`examples/utils.py`.
+`examples/utils.py`. Its Mip-NeRF360 loader preserves per-image COLMAP
+intrinsics as `frame["K"]` and stacked `Ks`; `K` remains the first selected
+intrinsic only for legacy checkpoint/viewer compatibility.
 
 `python/diffsoup/` is the public Python package. It imports the compiled
 `diffsoup._core` nanobind extension and exposes:
@@ -123,14 +125,20 @@ The prior data contract is:
 - `depth/<view-stem>.png`: uint16 encoded inverse camera-Z;
 - `normals/` for full resolution or `normals_<downscale>/`: uint8 camera-space
   XYZ normals with `[127,127,127]` as the invalid sentinel;
-- `sparse/0/depth_params.json`: per-view positive scale and finite offset.
+- `sparse/0/depth_params.json`: per-view positive `png_scale`, finite offset,
+  independent `depth_reliable` / `normal_reliable` flags, fit diagnostics, and
+  the `camera_xyz_opencv_y_down` normal convention. The loader accepts legacy
+  `scale` as a decode-scale alias, but scale magnitude is not a quality gate.
 
 `08_prepare_geometry_priors.py` requires CUDA, binary COLMAP data, the pinned
 ARAG source, and an external `ckpt_promask_best.pth`. It buffers coarse DA-v2
 depth and Metric3D-v2 normals in CPU memory, refines them with ARAG, aligns
-inverse depth to sparse COLMAP camera-Z, validates every view, writes to a
-temporary staging directory, and publishes the three targets with rollback.
-It must not replace an existing prior layout without `--overwrite`.
+inverse depth to sparse COLMAP camera-Z, validates depth and normals
+independently per view, writes neutral placeholders for unreliable modalities,
+and records explicit reliability flags before publishing the three staged
+targets with rollback. The scene is rejected only when no view provides either
+a reliable depth or normal prior. It must not replace an existing prior layout
+without `--overwrite`.
 
 The training prior path deliberately fixes and detaches raster fragment
 identity, raster-depth ordering, opacity, sampled pixels, cameras, and target
@@ -138,7 +146,24 @@ priors. Only ray-plane intersections and face normals recomputed from live
 vertices are differentiable. Preserve that vertex-only contract, exact
 front-to-back fixed-opacity compositing, face-forward camera-space normals,
 and masked inverse-camera-Z loss unless a change is paired with focused
-forward and finite-difference gradient tests.
+forward and finite-difference gradient tests. Depth supervision uses
+`expected_camera_z / accumulated_opacity.detach()`, i.e. conditional expected
+camera-Z, so sub-opaque coverage cannot move a single surface to
+`z_target / opacity`. Normal supervision uses
+`accumulated_opacity.detach() - dot(rendered_normal, prior_normal)`, the
+opacity-weighted expectation of per-fragment angular error; this removes the
+unoptimizable `1 - opacity` floor without opening an alpha gradient. Normal and
+depth losses both exclude missing surfaces while retaining the full
+sampled-row denominator. The experimental trainer loads only enabled prior
+modalities and, at the first active step and every 100 steps thereafter,
+records separate hit fractions, accumulated-opacity q10/q50/q90 and fractions
+above 0.5/0.9, normal concentration/cosine, and prior-specific vertex-gradient
+norms. Depth supervision starts at iteration 1 and log-linearly decays from the
+fixed `LAMBDA_DEPTH_PRIOR_INITIAL = 0.01` to
+`LAMBDA_DEPTH_PRIOR_FINAL = 0.001` over `schedule_steps`. Normal supervision
+uses the fixed `LAMBDA_NORMAL_PRIOR = 0.01`, remains disabled until
+`normal_prior_start`, and then linearly ramps over `normal_prior_ramp_steps`.
+The three lambda values are code constants, not CLI options.
 
 ## Environment, Build, and Smoke Commands
 
@@ -183,7 +208,7 @@ python examples/01_mip360.py --scene_root ./datasets/360_v2/garden --out_dir ./r
 python examples/02_mip360_test.py --scene_root ./datasets/360_v2/garden --steps 20 --schedule_steps 10000 --out_dir ./results/smoke_02_garden
 python examples/03_random_init.py --scene lego --out_dir ./results/smoke_03_lego
 python examples/08_prepare_geometry_priors.py --scene-root ./datasets/360_v2/garden
-python examples/02_mip360_test.py --scene_root ./datasets/360_v2/garden --normal_prior_weight 0.01 --depth_prior_weight 0.01 --out_dir ./results/02_mip360/garden_arag
+python examples/02_mip360_test.py --scene_root ./datasets/360_v2/garden --out_dir ./results/02_mip360/garden_arag
 python -m pip install -v viewer/
 python examples/04_view_results.py --ckpt results/02_mip360/garden_arag/final_params.pt
 ```
@@ -282,17 +307,16 @@ ignored and can be invisible to ordinary `rg --files`; inspect it with
 `Get-ChildItem tests` or `rg --no-ignore --files tests`. A new test intended for
 review must be deliberately unignored and confirmed in `git status`.
 
-The ignored local tests are a mixed development snapshot, not one coherent
-suite. At this checkout, full collection reaches 76 tests but errors because
-`python/diffsoup/consistency.py` and
-`examples/09_prepare_depth_confidence.py` do not exist. Several prior tests also
-expect later/unimplemented confidence weighting, depth-gradient APIs, and CLI
-wiring. Do not run `pytest tests` and report it as the current repository
-status, and do not treat stale `.pyc` files as source. The focused native CUDA
-regression file is currently aligned with the implementation:
+The ignored local tests are development-only and must not be treated as
+committed coverage. The current focused geometry-prior files are aligned with
+the implementation and cover conditional depth, missing-surface masking,
+fixed-fragment gradients, per-view reliability, optional modality loading, and
+COLMAP half-pixel coordinates. Do not treat stale `.pyc` files as source. Run
+focused checks before using the broader local snapshot as a gate:
 
 ```bash
 python -m pytest -q -p no:cacheprovider tests/test_cuda_optimizations.py
+python -m pytest -q -p no:cacheprovider tests/test_regularization.py tests/test_geometry_priors.py
 python -m compileall -q python py_viewer examples
 pyrefly check --python-interpreter-path <activated-python> examples/utils.py examples/01_mip360.py examples/02_mip360_test.py examples/03_random_init.py examples/08_prepare_geometry_priors.py py_viewer
 python examples/00_version.py

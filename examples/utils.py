@@ -320,38 +320,24 @@ def load_mipnerf360_scene(
     device: Optional[torch.device] = None,
     linearize: bool = False,
 ) -> Dict:
-    """Load a MipNeRF-360 COLMAP scene with a 3DGS-compatible train/test split.
+    """Load a MipNeRF-360 COLMAP scene with a 3DGS-compatible split.
 
-    Args:
-        scene_root: Path to the scene directory.
-        split:      ``"train"`` or ``"test"``.
-        holdout:    Every *holdout*-th view goes to the test set (default 8,
-                    matching 3DGS).
-        downscale:  Image downscale factor.  0 or 1 → ``images/``,
-                    2 → ``images_2/``, 4 → ``images_4/``, etc.
-        device:     Target device for tensors (``None`` = CPU).
-        linearize:  If ``True``, convert sRGB images to linear.
-
-    Returns:
-        Dict with keys ``frames``, ``K``, ``H``, ``W``, ``orig_H``,
-        ``orig_W``, ``folder``.  Each frame dict contains ``c2w``, ``Tcw``,
-        ``image``, and ``img_path``.
+    Every frame carries its own scaled ``K``. The returned ``Ks`` tensor follows
+    frame order, while ``K`` remains the first selected intrinsic for checkpoint
+    and viewer compatibility.
     """
     spr = _colmap_root(scene_root)
     cams = _read_cameras(spr)
     imgs = _read_images(spr)
 
-    # Intrinsics from first camera
     first_cam = cams[imgs[0]["camera_id"]]
-    K0, orig_H, orig_W = _intrinsics_from_camera(first_cam)
+    _, orig_H, orig_W = _intrinsics_from_camera(first_cam)
 
-    # Image folder
     folder = _image_folder_name(downscale)
     img_dir = os.path.join(scene_root, folder)
     if not os.path.isdir(img_dir):
         raise FileNotFoundError(f"'{folder}' folder not found at: {img_dir}")
 
-    # Determine actual resolution from first image
     name0 = imgs[0]["name"]
     p0 = os.path.join(img_dir, name0)
     if not os.path.exists(p0):
@@ -359,13 +345,6 @@ def load_mipnerf360_scene(
     im0 = iio.imread(p0)
     out_H, out_W = im0.shape[0], im0.shape[1]
 
-    # Scale intrinsics to match chosen image folder
-    sx, sy = out_W / float(orig_W), out_H / float(orig_H)
-    K = K0.clone()
-    K[0, 0] *= sx; K[1, 1] *= sy
-    K[0, 2] *= sx; K[1, 2] *= sy
-
-    # 3DGS-exact LLFF train/test split
     sorted_indices = sorted(range(len(imgs)), key=lambda i: imgs[i]["name"])
     test_set = set()
     for rank, idx in enumerate(sorted_indices):
@@ -376,16 +355,29 @@ def load_mipnerf360_scene(
         selected = [i for i in sorted_indices if i in test_set]
     else:
         selected = [i for i in sorted_indices if i not in test_set]
+    assert selected, f"{split!r} split selected no images"
 
-    # Build frames
     frames = []
     for i in selected:
         rec = imgs[i]
+        camera = cams[rec["camera_id"]]
+        frame_K, camera_H, camera_W = _intrinsics_from_camera(camera)
+        sx, sy = out_W / float(camera_W), out_H / float(camera_H)
+        frame_K = frame_K.clone()
+        frame_K[0, 0] *= sx
+        frame_K[1, 1] *= sy
+        frame_K[0, 2] *= sx
+        frame_K[1, 2] *= sy
+
         R = _qvec2rotmat(rec["qvec"])
         tvec = rec["tvec"].reshape(3, 1)
 
-        Tcw = np.eye(4); Tcw[:3, :3] = R; Tcw[:3, 3:4] = tvec
-        c2w = np.eye(4); c2w[:3, :3] = R.T; c2w[:3, 3] = (-R.T @ tvec).ravel()
+        Tcw = np.eye(4)
+        Tcw[:3, :3] = R
+        Tcw[:3, 3:4] = tvec
+        c2w = np.eye(4)
+        c2w[:3, :3] = R.T
+        c2w[:3, 3] = (-R.T @ tvec).ravel()
 
         img_path = os.path.join(img_dir, rec["name"])
         if not os.path.exists(img_path):
@@ -403,25 +395,33 @@ def load_mipnerf360_scene(
             ).permute(1, 2, 0)
         if linearize:
             a = (img <= 0.04045).float()
-            img = a * (img / 12.92) + (1 - a) * torch.pow((img + 0.055) / 1.055, 2.4)
+            img = (
+                a * (img / 12.92)
+                + (1 - a) * torch.pow((img + 0.055) / 1.055, 2.4)
+            )
 
         item = {
             "c2w": torch.from_numpy(c2w).float(),
             "Tcw": torch.from_numpy(Tcw).float(),
+            "K": frame_K,
+            "camera_id": rec["camera_id"],
             "image": img,
             "img_path": img_path,
         }
         if device is not None:
-            for k in ("c2w", "Tcw", "image"):
-                if torch.is_tensor(item[k]):
-                    item[k] = item[k].to(device)
+            for key in ("c2w", "Tcw", "K", "image"):
+                item[key] = item[key].to(device)
         frames.append(item)
 
+    Ks = torch.stack([frame["K"] for frame in frames], dim=0)
     return {
         "frames": frames,
-        "K": K.to(device) if device else K,
-        "H": out_H, "W": out_W,
-        "orig_H": orig_H, "orig_W": orig_W,
+        "K": Ks[0],
+        "Ks": Ks,
+        "H": out_H,
+        "W": out_W,
+        "orig_H": orig_H,
+        "orig_W": orig_W,
         "folder": folder,
     }
 
@@ -461,6 +461,21 @@ def exp_decay_mult(
     """Exponential learning-rate decay multiplier."""
     step = max(1, min(step, total_steps))
     return final_mult ** (step / float(total_steps))
+
+
+def log_linear_schedule(
+    initial: float,
+    final: float,
+    step: int,
+    total_steps: int,
+) -> float:
+    """Exponentially interpolate positive endpoints over 1-indexed steps."""
+    if total_steps <= 1:
+        return float(initial)
+    progress = np.clip((step - 1) / float(total_steps - 1), 0.0, 1.0)
+    return float(np.exp(
+        np.log(initial) * (1.0 - progress) + np.log(final) * progress
+    ))
 
 
 def count_visible_triangles(

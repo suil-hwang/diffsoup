@@ -326,7 +326,7 @@ def main():
 
             for fr in data["frames"]:
                 mvp = mvp_from_K_Tcw(
-                    K, fr["Tcw"], (H, W),
+                    fr["K"], fr["Tcw"], (H, W),
                     z_near=z_near, z_far=z_far, flip_z=flip_z,
                 )
                 mvps_list.append(mvp)

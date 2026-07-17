@@ -36,6 +36,7 @@ from utils import (
     project_vertices,
     psnr_fn,
     exp_decay_mult,
+    log_linear_schedule,
     count_visible_triangles,
     build_keep_map,
     split_edges_from_training_views,
@@ -44,6 +45,10 @@ from utils import (
 # ── Reproducibility ──────────────────────────────────────────────────
 
 SEED = 0
+PRIOR_OPACITY_LOG_INTERVAL = 100
+LAMBDA_NORMAL_PRIOR = 0.01
+LAMBDA_DEPTH_PRIOR_INITIAL = 0.01
+LAMBDA_DEPTH_PRIOR_FINAL = 0.001
 np.random.seed(SEED)
 random.seed(SEED)
 torch.manual_seed(SEED)
@@ -51,6 +56,19 @@ torch.cuda.manual_seed_all(SEED)
 
 
 # ── Main ─────────────────────────────────────────────────────────────
+
+def _vertex_gradient_norm(
+    loss: torch.Tensor,
+    vertices: torch.Tensor,
+) -> float:
+    """Measure one loss term without accumulating into ``vertices.grad``."""
+    gradient = torch.autograd.grad(
+        loss, vertices, retain_graph=True, allow_unused=True,
+    )[0]
+    if gradient is None:
+        return 0.0
+    return float(gradient.detach().norm().item())
+
 
 def main(
     scene_root: str = "./datasets/360_v2/kitchen",
@@ -63,13 +81,14 @@ def main(
     out_dir: Optional[str] = None,
     overwrite: bool = False,
     prior_root: Optional[str] = None,
-    normal_prior_weight: float = 0.0,
-    depth_prior_weight: float = 0.0,
-    prior_start: int = 5_501,
-    prior_ramp_steps: int = 500,
+    normal_prior_start: int = 5_501,
+    normal_prior_ramp_steps: int = 500,
     prior_samples_per_view: int = 16_384,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    lambda_normal_prior = LAMBDA_NORMAL_PRIOR
+    lambda_depth_prior = LAMBDA_DEPTH_PRIOR_INITIAL
+    lambda_depth_prior_final = LAMBDA_DEPTH_PRIOR_FINAL
     print(f"[ssim] backend={SSIM_BACKEND}")
     scene_name = os.path.basename(os.path.normpath(scene_root))
     if out_dir is None:
@@ -90,26 +109,38 @@ def main(
     train_data = load_mipnerf360_scene(
         scene_root, split="train", downscale=downscale, device=device,
     )
-    K, H, W = train_data["K"], train_data["H"], train_data["W"]
+    K, Ks, H, W = train_data["K"], train_data["Ks"], train_data["H"], train_data["W"]
     frames = train_data["frames"]
     N_train = len(frames)
     print(f"[views] train={N_train}  folder={train_data['folder']} size={H}x{W}")
     if schedule_steps <= 0:
         raise ValueError("schedule_steps must be positive")
     if (
-        not np.isfinite(normal_prior_weight)
-        or not np.isfinite(depth_prior_weight)
-        or normal_prior_weight < 0
-        or depth_prior_weight < 0
+        not np.isfinite(lambda_normal_prior)
+        or not np.isfinite(lambda_depth_prior)
+        or not np.isfinite(lambda_depth_prior_final)
+        or lambda_normal_prior < 0
+        or lambda_depth_prior < 0
+        or lambda_depth_prior_final < 0
     ):
-        raise ValueError("prior weights must be nonnegative")
-    if prior_start < 1:
-        raise ValueError("prior_start must be at least 1")
-    if prior_ramp_steps < 0:
-        raise ValueError("prior_ramp_steps must be nonnegative")
+        raise ValueError("prior lambdas must be finite and nonnegative")
+    if (
+        lambda_depth_prior > 0
+        and not 0 < lambda_depth_prior_final <= lambda_depth_prior
+    ):
+        raise ValueError(
+            "lambda_depth_prior_final must be in "
+            "(0, lambda_depth_prior] when depth supervision is enabled"
+        )
+    if normal_prior_start < 1:
+        raise ValueError("normal_prior_start must be at least 1")
+    if normal_prior_ramp_steps < 0:
+        raise ValueError("normal_prior_ramp_steps must be nonnegative")
     if prior_samples_per_view <= 0:
         raise ValueError("prior_samples_per_view must be positive")
-    use_geometry_prior = normal_prior_weight > 0 or depth_prior_weight > 0
+    use_normal_prior = lambda_normal_prior > 0
+    use_depth_prior = lambda_depth_prior > 0
+    use_geometry_prior = use_normal_prior or use_depth_prior
     if use_geometry_prior and prior_root is None:
         # Scene-level depth/normal PNGs are the default prior interface.
         prior_root = scene_root
@@ -167,7 +198,7 @@ def main(
     z_near_train, z_near_test, z_far = 0.01, 0.5, 100.0
 
     MVPs = torch.stack([
-        mvp_from_K_Tcw(K, fr["Tcw"], (H, W), z_near=z_near_train, z_far=z_far, flip_z=flip_z)
+        mvp_from_K_Tcw(fr["K"], fr["Tcw"], (H, W), z_near=z_near_train, z_far=z_far, flip_z=flip_z)
         for fr in frames
     ], dim=0)
     MVPs_inv = torch.inverse(MVPs).contiguous()
@@ -182,11 +213,15 @@ def main(
             view_names,
             (H, W),
             downscale=downscale,
+            load_depth=use_depth_prior,
+            load_normal=use_normal_prior,
         )
         print(
-            f"[prior] normal_weight={normal_prior_weight:g} "
-            f"depth_weight={depth_prior_weight:g} start={prior_start} "
-            f"ramp={prior_ramp_steps} samples/view={prior_samples_per_view:,}"
+            f"[prior] normal={lambda_normal_prior:g} "
+            f"start={normal_prior_start} ramp={normal_prior_ramp_steps} "
+            f"depth={lambda_depth_prior:g}->{lambda_depth_prior_final:g} "
+            f"decay_steps={schedule_steps} "
+            f"samples/view={prior_samples_per_view:,}"
         )
 
     # ``gt_rgb`` owns the stacked images; retaining the per-frame tensors
@@ -255,11 +290,22 @@ def main(
         "photometric": [],
         "normal_prior": [],
         "depth_prior": [],
-        "prior_ramp": [],
+        "normal_prior_ramp": [],
+        "lambda_normal_prior_effective": [],
+        "lambda_depth_prior_effective": [],
         "weighted_normal_prior": [],
         "weighted_depth_prior": [],
         "normal_hit_fraction": [],
         "depth_hit_fraction": [],
+        "prior_opacity_q10": [],
+        "prior_opacity_q50": [],
+        "prior_opacity_q90": [],
+        "prior_opacity_over_05_fraction": [],
+        "prior_opacity_over_09_fraction": [],
+        "normal_concentration_mean": [],
+        "normal_cosine_mean": [],
+        "normal_vertex_grad_norm": [],
+        "depth_vertex_grad_norm": [],
         "vertex_grad_norm": [],
         "faces": [],
     }
@@ -273,6 +319,9 @@ def main(
     geometry_prior_rng = (
         np.random.default_rng(SEED + 10_003) if use_geometry_prior else None
     )
+    last_prior_opacity_q50 = 0.0
+    last_normal_vertex_grad_norm = 0.0
+    last_depth_vertex_grad_norm = 0.0
 
     pbar = tqdm(range(1, steps + 1), desc="optimising", leave=True)
     for i_iter in pbar:
@@ -329,14 +378,26 @@ def main(
         ))
         photometric_loss = aux_loss + 0.8 * l1_loss + 0.2 * ssim_loss
 
-        if not use_geometry_prior or i_iter < prior_start:
-            prior_ramp = 0.0
-        elif prior_ramp_steps == 0:
-            prior_ramp = 1.0
+        if not use_normal_prior or i_iter < normal_prior_start:
+            normal_prior_ramp = 0.0
+        elif normal_prior_ramp_steps == 0:
+            normal_prior_ramp = 1.0
         else:
-            prior_ramp = min(
-                1.0, (i_iter - prior_start + 1) / prior_ramp_steps,
+            normal_prior_ramp = min(
+                1.0, (i_iter - normal_prior_start + 1) / normal_prior_ramp_steps,
             )
+        lambda_normal_prior_effective = (
+            normal_prior_ramp * lambda_normal_prior
+        )
+        lambda_depth_prior_effective = (
+            log_linear_schedule(
+                lambda_depth_prior,
+                lambda_depth_prior_final,
+                i_iter,
+                schedule_steps,
+            )
+            if use_depth_prior else 0.0
+        )
 
         normal_prior_loss = None
         depth_prior_loss = None
@@ -344,7 +405,17 @@ def main(
         expected_surface = None
         normal_hit_fraction = 0.0
         depth_hit_fraction = 0.0
-        if use_geometry_prior and prior_ramp > 0:
+        prior_opacity_q10 = float("nan")
+        prior_opacity_q50 = float("nan")
+        prior_opacity_q90 = float("nan")
+        prior_opacity_over_05_fraction = float("nan")
+        prior_opacity_over_09_fraction = float("nan")
+        normal_concentration_mean = float("nan")
+        normal_cosine_mean = float("nan")
+        normal_vertex_grad_norm = float("nan")
+        depth_vertex_grad_norm = float("nan")
+        measure_prior = False
+        if lambda_normal_prior_effective > 0 or lambda_depth_prior_effective > 0:
             assert prior_store is not None
             assert geometry_prior_rng is not None
             assert Tcws is not None
@@ -356,19 +427,20 @@ def main(
                 dtype=V_single.dtype,
             )
             batch_Tcw = Tcws[batch_idx]
+            batch_K = Ks[batch_idx]
             expected_surface = ds.vertex_expected_surface_samples(
                 V_single,
                 F,
                 fragments.frag_pix,
                 fragments.frag_attrs,
                 fragments.frag_alpha,
-                K,
+                batch_K,
                 batch_Tcw,
                 prior_samples.pixels_b_y_x,
                 (H, W),
             )
-            del batch_Tcw
-            if normal_prior_weight > 0:
+            del batch_Tcw, batch_K
+            if lambda_normal_prior_effective > 0:
                 normal_prior_loss = ds.normal_prior_loss(
                     expected_surface,
                     prior_samples.normal_camera,
@@ -382,7 +454,7 @@ def main(
                             & prior_samples.normal_valid
                         ).sum().detach().item() / normal_count
                     )
-            if depth_prior_weight > 0:
+            if lambda_depth_prior_effective > 0:
                 depth_prior_loss = ds.inverse_depth_prior_loss(
                     expected_surface,
                     prior_samples.inverse_camera_z,
@@ -396,13 +468,110 @@ def main(
                             & prior_samples.depth_valid
                         ).sum().detach().item() / depth_count
                     )
+            active_prior = torch.zeros_like(expected_surface.valid)
+            if lambda_normal_prior_effective > 0:
+                active_prior |= prior_samples.normal_valid
+            if lambda_depth_prior_effective > 0:
+                active_prior |= prior_samples.depth_valid
+            opacity_mask = expected_surface.valid & active_prior
+            measure_prior = (
+                (use_depth_prior and i_iter == 1)
+                or (use_normal_prior and i_iter == normal_prior_start)
+                or i_iter % PRIOR_OPACITY_LOG_INTERVAL == 0
+            )
+            if measure_prior and opacity_mask.any():
+                opacity_values = (
+                    expected_surface.accumulated_opacity[opacity_mask]
+                    .detach()
+                    .float()
+                )
+                opacity_quantiles = torch.quantile(
+                    opacity_values,
+                    torch.tensor(
+                        [0.1, 0.5, 0.9], device=device, dtype=torch.float32,
+                    ),
+                ).cpu().tolist()
+                (
+                    prior_opacity_q10,
+                    prior_opacity_q50,
+                    prior_opacity_q90,
+                ) = map(float, opacity_quantiles)
+                prior_opacity_over_05_fraction = float(
+                    (opacity_values >= 0.5).float().mean().item()
+                )
+                prior_opacity_over_09_fraction = float(
+                    (opacity_values >= 0.9).float().mean().item()
+                )
+                last_prior_opacity_q50 = prior_opacity_q50
+                del opacity_values
+            if measure_prior and lambda_normal_prior_effective > 0:
+                normal_mask = (
+                    expected_surface.valid & prior_samples.normal_valid
+                )
+                if normal_mask.any():
+                    rendered_normal = (
+                        expected_surface.rendered_normal_camera[normal_mask]
+                        .detach()
+                        .float()
+                    )
+                    target_normal = (
+                        prior_samples.normal_camera[normal_mask]
+                        .detach()
+                        .float()
+                    )
+                    normal_magnitude = torch.linalg.vector_norm(
+                        rendered_normal, dim=-1,
+                    )
+                    normal_opacity = (
+                        expected_surface.accumulated_opacity[normal_mask]
+                        .detach()
+                        .float()
+                    )
+                    tiny = torch.finfo(torch.float32).tiny
+                    normal_concentration_mean = float(
+                        (
+                            normal_magnitude
+                            / normal_opacity.clamp_min(tiny)
+                        ).mean().item()
+                    )
+                    cosine = (
+                        (rendered_normal * target_normal).sum(dim=-1)
+                        / (
+                            normal_magnitude
+                            * torch.linalg.vector_norm(target_normal, dim=-1)
+                        ).clamp_min(tiny)
+                    )
+                    normal_cosine_mean = float(
+                        cosine.clamp(-1.0, 1.0).mean().item()
+                    )
+                    del rendered_normal, target_normal
+                    del normal_magnitude, normal_opacity, cosine
         del fragments
 
         loss = photometric_loss
+        weighted_normal_prior_loss = None
+        weighted_depth_prior_loss = None
         if normal_prior_loss is not None:
-            loss = loss + prior_ramp * normal_prior_weight * normal_prior_loss
+            weighted_normal_prior_loss = (
+                lambda_normal_prior_effective * normal_prior_loss
+            )
+            loss = loss + weighted_normal_prior_loss
         if depth_prior_loss is not None:
-            loss = loss + prior_ramp * depth_prior_weight * depth_prior_loss
+            weighted_depth_prior_loss = (
+                lambda_depth_prior_effective * depth_prior_loss
+            )
+            loss = loss + weighted_depth_prior_loss
+
+        if measure_prior and weighted_normal_prior_loss is not None:
+            normal_vertex_grad_norm = _vertex_gradient_norm(
+                weighted_normal_prior_loss, V_single,
+            )
+            last_normal_vertex_grad_norm = normal_vertex_grad_norm
+        if measure_prior and weighted_depth_prior_loss is not None:
+            depth_vertex_grad_norm = _vertex_gradient_norm(
+                weighted_depth_prior_loss, V_single,
+            )
+            last_depth_vertex_grad_norm = depth_vertex_grad_norm
 
         loss.backward()
         vertex_grad_norm = (
@@ -434,22 +603,53 @@ def main(
         loss_terms["photometric"].append(photo_value)
         loss_terms["normal_prior"].append(normal_value)
         loss_terms["depth_prior"].append(depth_value)
-        loss_terms["prior_ramp"].append(prior_ramp)
+        loss_terms["normal_prior_ramp"].append(normal_prior_ramp)
+        loss_terms["lambda_normal_prior_effective"].append(
+            lambda_normal_prior_effective
+        )
+        loss_terms["lambda_depth_prior_effective"].append(
+            lambda_depth_prior_effective
+        )
         loss_terms["weighted_normal_prior"].append(
-            prior_ramp * normal_prior_weight * normal_value
+            lambda_normal_prior_effective * normal_value
         )
         loss_terms["weighted_depth_prior"].append(
-            prior_ramp * depth_prior_weight * depth_value
+            lambda_depth_prior_effective * depth_value
         )
         loss_terms["normal_hit_fraction"].append(normal_hit_fraction)
         loss_terms["depth_hit_fraction"].append(depth_hit_fraction)
+        loss_terms["prior_opacity_q10"].append(prior_opacity_q10)
+        loss_terms["prior_opacity_q50"].append(prior_opacity_q50)
+        loss_terms["prior_opacity_q90"].append(prior_opacity_q90)
+        loss_terms["prior_opacity_over_05_fraction"].append(
+            prior_opacity_over_05_fraction
+        )
+        loss_terms["prior_opacity_over_09_fraction"].append(
+            prior_opacity_over_09_fraction
+        )
+        loss_terms["normal_concentration_mean"].append(
+            normal_concentration_mean
+        )
+        loss_terms["normal_cosine_mean"].append(normal_cosine_mean)
+        loss_terms["normal_vertex_grad_norm"].append(
+            normal_vertex_grad_norm
+        )
+        loss_terms["depth_vertex_grad_norm"].append(
+            depth_vertex_grad_norm
+        )
         loss_terms["vertex_grad_norm"].append(vertex_grad_norm)
         loss_terms["faces"].append(int(F.shape[0]))
         pbar.set_postfix(
             loss=f"{l:.6f}",
             Ln=f"{normal_value:.4f}",
             Ld=f"{depth_value:.4f}",
-            hit=f"{max(normal_hit_fraction, depth_hit_fraction):.3f}",
+            wn=f"{lambda_normal_prior_effective:.2e}",
+            wd=f"{lambda_depth_prior_effective:.2e}",
+            hit_n=f"{normal_hit_fraction:.3f}",
+            hit_d=f"{depth_hit_fraction:.3f}",
+            A50=f"{last_prior_opacity_q50:.3f}",
+            gN=f"{last_normal_vertex_grad_norm:.2e}",
+            gD=f"{last_depth_vertex_grad_norm:.2e}",
         )
 
         # Python function scope otherwise retains these outputs until the next
@@ -461,6 +661,10 @@ def main(
             del normal_prior_loss
         if depth_prior_loss is not None:
             del depth_prior_loss
+        if weighted_normal_prior_loss is not None:
+            del weighted_normal_prior_loss
+        if weighted_depth_prior_loss is not None:
+            del weighted_depth_prior_loss
         if prior_samples is not None:
             del prior_samples, expected_surface
 
@@ -633,6 +837,7 @@ def main(
         "Rmax": Rmax,
         "feat_dim": feat_dim,
         "K": K.detach().cpu(), "H": H, "W": W,
+        "Ks": Ks.detach().cpu(),
         "flip_z": flip_z,
         "steps": steps,
         "schedule_steps": schedule_steps,
@@ -641,11 +846,18 @@ def main(
         "geometry_prior": {
             "root": prior_root,
             "downscale": downscale,
-            "normal_weight": normal_prior_weight,
-            "depth_weight": depth_prior_weight,
-            "start": prior_start,
-            "ramp_steps": prior_ramp_steps,
+            "lambda_normal_prior": lambda_normal_prior,
+            "lambda_depth_prior": lambda_depth_prior,
+            "lambda_depth_prior_final": lambda_depth_prior_final,
+            "normal_start": normal_prior_start,
+            "normal_ramp_steps": normal_prior_ramp_steps,
+            "depth_start": 1 if use_depth_prior else None,
+            "depth_schedule": "log_linear",
+            "depth_schedule_steps": schedule_steps,
             "samples_per_view": prior_samples_per_view,
+            "depth_expectation": "conditional_camera_z",
+            "normal_expectation": "per_fragment_angular_error",
+            "telemetry_interval": PRIOR_OPACITY_LOG_INTERVAL,
         },
         "seed": SEED,
     }, ckpt_path)
@@ -667,7 +879,7 @@ def main(
     with torch.no_grad():
         for i, fr in enumerate(test_frames):
             MVP = mvp_from_K_Tcw(
-                K, fr["Tcw"], (H, W), z_near=z_near_test, z_far=z_far, flip_z=flip_z,
+                fr["K"], fr["Tcw"], (H, W), z_near=z_near_test, z_far=z_far, flip_z=flip_z,
             ).unsqueeze(0)
             MVP_inv = torch.inverse(MVP).contiguous()
             V_clip = project_vertices(V_single, MVP)
@@ -724,7 +936,7 @@ if __name__ == "__main__":
     parser.add_argument("--steps", type=int, default=10_000)
     parser.add_argument(
         "--schedule_steps", type=int, default=10_000,
-        help="Reference horizon for LR decay; keep 10000 for comparable short smokes",
+        help="Reference horizon for LR and depth-prior decay",
     )
     parser.add_argument("--n_points", type=int, default=15_000)
     parser.add_argument("--downscale", type=int, default=4, choices=[0, 1, 2, 4, 8],
@@ -742,10 +954,8 @@ if __name__ == "__main__":
         "--prior_root", type=str, default=None,
         help="Prior scene root; defaults to --scene_root when a prior loss is enabled.",
     )
-    parser.add_argument("--normal_prior_weight", type=float, default=0.0)
-    parser.add_argument("--depth_prior_weight", type=float, default=0.0)
-    parser.add_argument("--prior_start", type=int, default=5_501)
-    parser.add_argument("--prior_ramp_steps", type=int, default=500)
+    parser.add_argument("--normal_prior_start", type=int, default=5_501)
+    parser.add_argument("--normal_prior_ramp_steps", type=int, default=500)
     parser.add_argument("--prior_samples_per_view", type=int, default=16_384)
     args = parser.parse_args()
 
@@ -760,9 +970,7 @@ if __name__ == "__main__":
         out_dir=args.out_dir,
         overwrite=args.overwrite,
         prior_root=args.prior_root,
-        normal_prior_weight=args.normal_prior_weight,
-        depth_prior_weight=args.depth_prior_weight,
-        prior_start=args.prior_start,
-        prior_ramp_steps=args.prior_ramp_steps,
+        normal_prior_start=args.normal_prior_start,
+        normal_prior_ramp_steps=args.normal_prior_ramp_steps,
         prior_samples_per_view=args.prior_samples_per_view,
     )

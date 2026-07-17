@@ -1,3 +1,4 @@
+# examples/08_prepare_geometry_priors.py
 """Prepare ARAG depth and normal supervision for a MipNeRF-360 scene."""
 
 from __future__ import annotations
@@ -44,6 +45,7 @@ _MAX_DEPTH_MEDIAN_ABS_REL = 0.35
 _MAX_DEPTH_P90_ABS_REL = 1.0
 _MIN_SPARSE_FIT_POINTS = 32
 _MIN_SPARSE_VALIDATION_POINTS = 8
+_NORMAL_CONVENTION = "camera_xyz_opencv_y_down"
 
 
 def _canonicalize_arag_normals(
@@ -396,8 +398,12 @@ def _sparse_samples(
     camera_z = xyz @ rotation[2, :] + record.tvec[2]
     height, width = raw_depth.shape
     scaled_xy = np.empty_like(xy)
-    scaled_xy[:, 0] = (xy[:, 0] + 0.5) * width / float(camera["w"]) - 0.5
-    scaled_xy[:, 1] = (xy[:, 1] + 0.5) * height / float(camera["h"]) - 0.5
+    # COLMAP stores continuous image coordinates with the top-left pixel centre
+    # at (0.5, 0.5). Convert them to zero-based array-index coordinates after
+    # resizing; adding another half pixel would shift downscale-4 samples by
+    # +0.125 target pixels on both axes.
+    scaled_xy[:, 0] = xy[:, 0] * width / float(camera["w"]) - 0.5
+    scaled_xy[:, 1] = xy[:, 1] * height / float(camera["h"]) - 0.5
     relative, inside = _sample_bilinear(raw_depth, scaled_xy)
     valid = inside & np.isfinite(relative) & np.isfinite(camera_z) & (camera_z > 0)
     return relative[valid], 1.0 / camera_z[valid], ids[valid]
@@ -601,22 +607,41 @@ def _run_arag_refiner(
 
 def _validate_frame(
     name: str,
-    fit: dict,
+    fit: dict | None,
     depth_valid: np.ndarray,
     normal_valid: np.ndarray,
-) -> None:
-    failures = []
-    if float(depth_valid.mean()) < _MIN_DEPTH_VALID_FRACTION:
-        failures.append("insufficient valid depth")
-    if float(normal_valid.mean()) < _MIN_NORMAL_VALID_FRACTION:
-        failures.append("insufficient valid normals")
-    metrics = fit["validation_metrics"]
-    if metrics["median_abs_rel"] > _MAX_DEPTH_MEDIAN_ABS_REL:
-        failures.append("depth median AbsRel is too large")
-    if metrics["p90_abs_rel"] > _MAX_DEPTH_P90_ABS_REL:
-        failures.append("depth p90 AbsRel is too large")
+    *,
+    depth_error: str | None = None,
+    normal_error: str | None = None,
+) -> tuple[bool, bool, tuple[str, ...]]:
+    """Return independent per-view reliability flags and failure reasons."""
+    depth_failures = []
+    normal_failures = []
+    if depth_error is not None:
+        depth_failures.append(depth_error)
+    elif fit is None:
+        depth_failures.append("depth alignment did not produce a fit")
+    else:
+        if float(depth_valid.mean()) < _MIN_DEPTH_VALID_FRACTION:
+            depth_failures.append("insufficient valid depth")
+        metrics = fit["validation_metrics"]
+        if metrics["median_abs_rel"] > _MAX_DEPTH_MEDIAN_ABS_REL:
+            depth_failures.append("depth median AbsRel is too large")
+        if metrics["p90_abs_rel"] > _MAX_DEPTH_P90_ABS_REL:
+            depth_failures.append("depth p90 AbsRel is too large")
+
+    if normal_error is not None:
+        normal_failures.append(normal_error)
+    elif float(normal_valid.mean()) < _MIN_NORMAL_VALID_FRACTION:
+        normal_failures.append("insufficient valid normals")
+
+    failures = tuple(
+        [f"depth: {failure}" for failure in depth_failures]
+        + [f"normal: {failure}" for failure in normal_failures]
+    )
     if failures:
-        raise ValueError(f"{name}: " + "; ".join(failures))
+        failures = tuple(f"{name}: {failure}" for failure in failures)
+    return not depth_failures, not normal_failures, failures
 
 
 def _stage_refined_priors(
@@ -642,7 +667,10 @@ def _stage_refined_priors(
         _ceil_multiple(width, patch_split[1]),
     )
     model = None
-    depth_params: dict[str, dict[str, float]] = {}
+    depth_params: dict[str, dict[str, object]] = {}
+    depth_reliable_frames = 0
+    normal_reliable_frames = 0
+    unreliable_frames = 0
     try:
         processor, built_height, built_width = infer_module.build_patch_processor(
             aligned_size[0], aligned_size[1], patch_split,
@@ -670,26 +698,88 @@ def _stage_refined_priors(
             del coarse_depth, coarse_normal
 
             camera = scene.cameras[record.camera_id]
-            relative, target, point_ids = _sparse_samples(
-                record, camera, scene.points, raw_depth,
+            fit = None
+            depth_error = None
+            inverse_depth = np.zeros((height, width), dtype=np.float32)
+            depth_valid = np.zeros((height, width), dtype=np.bool_)
+            try:
+                relative, target, point_ids = _sparse_samples(
+                    record, camera, scene.points, raw_depth,
+                )
+                fit = _fit_depth(relative, target, point_ids)
+                inverse_depth, depth_valid = _canonical_depth(raw_depth, fit)
+            except (ValueError, FloatingPointError) as error:
+                depth_error = f"alignment failed ({error})"
+
+            normal_error = None
+            normal = np.zeros((height, width, 3), dtype=np.float32)
+            normal_valid = np.zeros((height, width), dtype=np.bool_)
+            try:
+                K = _scaled_intrinsics(camera, height, width)
+                normal_t, normal_valid_t = _canonicalize_arag_normals(
+                    torch.from_numpy(raw_normal),
+                    torch.from_numpy(K.astype(np.float32)),
+                )
+                normal = normal_t.numpy()
+                normal_valid = normal_valid_t.numpy()
+            except (ValueError, FloatingPointError) as error:
+                normal_error = f"canonicalization failed ({error})"
+
+            depth_reliable, normal_reliable, failures = _validate_frame(
+                record.name,
+                fit,
+                depth_valid,
+                normal_valid,
+                depth_error=depth_error,
+                normal_error=normal_error,
             )
-            fit = _fit_depth(relative, target, point_ids)
-            inverse_depth, depth_valid = _canonical_depth(raw_depth, fit)
-            K = _scaled_intrinsics(camera, height, width)
-            normal_t, normal_valid_t = _canonicalize_arag_normals(
-                torch.from_numpy(raw_normal),
-                torch.from_numpy(K.astype(np.float32)),
-            )
-            normal, normal_valid = normal_t.numpy(), normal_valid_t.numpy()
-            _validate_frame(record.name, fit, depth_valid, normal_valid)
-            depth_u16, scale = _encode_depth_png(inverse_depth, depth_valid)
-            normal_u8 = _encode_normal_png(normal, normal_valid)
+            if depth_reliable:
+                depth_u16, png_scale = _encode_depth_png(
+                    inverse_depth, depth_valid,
+                )
+                depth_reliable_frames += 1
+            else:
+                depth_u16 = np.zeros((height, width), dtype=np.uint16)
+                png_scale = 1.0
+            if normal_reliable:
+                normal_u8 = _encode_normal_png(normal, normal_valid)
+                normal_reliable_frames += 1
+            else:
+                normal_u8 = np.full((height, width, 3), 127, dtype=np.uint8)
+            if failures:
+                unreliable_frames += 1
+                progress.write("[prior-skip] " + "; ".join(failures))
+
             iio.imwrite(depth_root / f"{stem}.png", depth_u16)
             iio.imwrite(normal_root / f"{stem}.png", normal_u8)
-            depth_params[stem] = {"scale": scale, "offset": 0.0}
+            frame_params: dict[str, object] = {
+                "png_scale": png_scale,
+                "offset": 0.0,
+                "depth_reliable": depth_reliable,
+                "normal_reliable": normal_reliable,
+                "normal_convention": _NORMAL_CONVENTION,
+            }
+            if fit is not None:
+                metrics = fit["validation_metrics"]
+                frame_params.update({
+                    "fit_transform": fit["transform"],
+                    "fit_slope": float(fit["slope"]),
+                    "fit_shift": float(fit["shift"]),
+                    "validation_mean_abs_rel": float(metrics["mean_abs_rel"]),
+                    "validation_median_abs_rel": float(
+                        metrics["median_abs_rel"]
+                    ),
+                    "validation_p90_abs_rel": float(metrics["p90_abs_rel"]),
+                })
+            if failures:
+                frame_params["failure_reasons"] = list(failures)
+            depth_params[stem] = frame_params
             progress.set_postfix(
-                transform=fit["transform"],
-                med=f"{fit['validation_metrics']['median_abs_rel']:.3f}",
+                transform=fit["transform"] if fit is not None else "invalid",
+                med=(
+                    f"{fit['validation_metrics']['median_abs_rel']:.3f}"
+                    if fit is not None else "n/a"
+                ),
             )
     finally:
         if model is not None:
@@ -697,13 +787,21 @@ def _stage_refined_priors(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    if depth_reliable_frames == 0 and normal_reliable_frames == 0:
+        raise ValueError("no view produced a reliable depth or normal prior")
+
     params_path = staging_root / "sparse" / "0" / "depth_params.json"
     params_path.parent.mkdir(parents=True)
     params_path.write_text(
         json.dumps(depth_params, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    return {"frames": len(scene.records)}
+    return {
+        "frames": len(scene.records),
+        "depth_reliable_frames": depth_reliable_frames,
+        "normal_reliable_frames": normal_reliable_frames,
+        "unreliable_frames": unreliable_frames,
+    }
 
 
 def _scene_prior_targets(scene_root: Path, normal_folder: str) -> dict[str, Path]:
@@ -842,4 +940,9 @@ if __name__ == "__main__":
     parser.add_argument("--patch-split", nargs=2, type=int, default=(2, 2))
     parser.add_argument("--overwrite", action="store_true")
     report = prepare_arag_scene(parser.parse_args())
-    print(f"[prepared] frames={report['frames']}")
+    print(
+        f"[prepared] frames={report['frames']} "
+        f"depth_reliable={report['depth_reliable_frames']} "
+        f"normal_reliable={report['normal_reliable_frames']} "
+        f"unreliable={report['unreliable_frames']}"
+    )
