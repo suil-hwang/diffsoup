@@ -9,3 +9,5 @@ scipy
 open3d
 trimesh
 scikit-image
+moderngl
+pyopengl

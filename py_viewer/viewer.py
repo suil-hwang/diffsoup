@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import ctypes
 import importlib
 import time
 from enum import Enum, IntEnum
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -99,12 +98,11 @@ def _load_shader_source(name: str) -> str:
 def _load_runtime(interactive: bool):
     try:
         glfw = importlib.import_module("glfw")
-        gl = importlib.import_module("OpenGL.GL")
-        gl_shaders = importlib.import_module("OpenGL.GL.shaders")
+        moderngl = importlib.import_module("moderngl")
     except ImportError as exc:
         raise RuntimeError(
-            "The Python viewer requires glfw and PyOpenGL. "
-            "Install them with `pip install glfw PyOpenGL`."
+            "The Python viewer requires glfw and ModernGL. "
+            "Install them with `pip install glfw moderngl`."
         ) from exc
 
     imgui = None
@@ -115,11 +113,11 @@ def _load_runtime(interactive: bool):
             integration = importlib.import_module("imgui.integrations.glfw")
         except ImportError as exc:
             raise RuntimeError(
-                "Interactive mode requires pyimgui. "
-                "Install it with `pip install imgui`."
+                "Interactive mode requires pyimgui and its PyOpenGL backend. "
+                "Install them with `pip install imgui PyOpenGL`."
             ) from exc
         glfw_renderer = integration.GlfwRenderer
-    return glfw, gl, gl_shaders, imgui, glfw_renderer
+    return glfw, moderngl, imgui, glfw_renderer
 
 
 def _tile_weights(weights: np.ndarray) -> np.ndarray:
@@ -139,6 +137,17 @@ def _tile_output_weights(weights: np.ndarray) -> np.ndarray:
     for tile_col in range(4):
         tiles[tile_col, :3, :] = weights[:, tile_col * 4 : tile_col * 4 + 4]
     return np.ascontiguousarray(tiles)
+
+
+def _matrix_bytes(matrix: np.ndarray) -> bytes:
+    """Return one row-major matrix as column-major OpenGL bytes."""
+    return np.ascontiguousarray(np.asarray(matrix, dtype=np.float32).T).tobytes()
+
+
+def _matrix_array_bytes(matrices: np.ndarray) -> bytes:
+    """Return row-major matrices as column-major OpenGL bytes."""
+    matrices = np.asarray(matrices, dtype=np.float32)
+    return np.ascontiguousarray(matrices.transpose(0, 2, 1)).tobytes()
 
 
 def _face_normals(verts: np.ndarray, faces: np.ndarray) -> np.ndarray:
@@ -256,12 +265,25 @@ class Viewer:
         self._depth_range_cache_mvp: np.ndarray | None = None
         self._depth_range_cache_clips: tuple[float, float] | None = None
 
-        self.glfw, self.gl, self.gl_shaders, self.imgui, renderer_cls = (
-            _load_runtime(interactive)
+        self.glfw, self.moderngl, self.imgui, renderer_cls = _load_runtime(
+            interactive
         )
         self.window = None
         self.imgui_renderer = None
         self.imgui_context = None
+        self.ctx: Any = None
+        self.geom_program: Any = None
+        self.post_program: Any = None
+        self.geom_vao: Any = None
+        self.post_vao: Any = None
+        self.position_buffer: Any = None
+        self.triangle_id_buffer: Any = None
+        self.normal_buffer: Any = None
+        self.lut_textures: list[Any] = []
+        self.geometry_fbo: Any = None
+        self.color_textures: list[Any] = []
+        self.depth_texture: Any = None
+        self._attachment_clear_fbos: list[Any] = []
         self._closed = False
 
         self.camera = OrbitCamera(
@@ -271,14 +293,20 @@ class Viewer:
             target=scene.center,
         )
 
-        self._create_window(width, height, visible=interactive)
-        if interactive:
-            self.imgui_context = self.imgui.create_context()
-            self.imgui.get_io().ini_file_name = None
-            self.imgui_renderer = renderer_cls(self.window, attach_callbacks=False)
+        try:
+            self._create_window(width, height, visible=interactive)
+            if interactive:
+                self.imgui_context = self.imgui.create_context()
+                self.imgui.get_io().ini_file_name = None
+                self.imgui_renderer = renderer_cls(
+                    self.window, attach_callbacks=False
+                )
 
-        self._install_callbacks()
-        self._init_gl()
+            self._install_callbacks()
+            self._init_gl()
+        except Exception:
+            self.close()
+            raise
 
     def _create_window(self, width: int, height: int, *, visible: bool) -> None:
         glfw = self.glfw
@@ -290,7 +318,9 @@ class Viewer:
         glfw.window_hint(glfw.OPENGL_FORWARD_COMPAT, glfw.TRUE)
         glfw.window_hint(glfw.DEPTH_BITS, 24)
         glfw.window_hint(glfw.VISIBLE, glfw.TRUE if visible else glfw.FALSE)
-        self.window = glfw.create_window(int(width), int(height), "DiffSoup Python Viewer", None, None)
+        self.window = glfw.create_window(
+            int(width), int(height), "DiffSoup Python Viewer", None, None
+        )
         if not self.window:
             glfw.terminate()
             raise RuntimeError("glfw.create_window() failed")
@@ -306,64 +336,43 @@ class Viewer:
         glfw.set_key_callback(self.window, self._on_key)
         glfw.set_char_callback(self.window, self._on_char)
 
-    def _compile_program(self, vertex: str, fragment: str) -> int:
-        gl = self.gl
-        return int(
-            self.gl_shaders.compileProgram(
-                self.gl_shaders.compileShader(vertex, gl.GL_VERTEX_SHADER),
-                self.gl_shaders.compileShader(fragment, gl.GL_FRAGMENT_SHADER),
-            )
-        )
-
     def _init_gl(self) -> None:
-        gl = self.gl
-        gl.glClearDepth(1.0)
-        gl.glDepthFunc(gl.GL_LESS)
-        gl.glPolygonMode(gl.GL_FRONT_AND_BACK, gl.GL_FILL)
+        self.ctx = self.moderngl.create_context(require=410)
+        self.ctx.gc_mode = None
+        self.ctx.depth_func = "<"
+        self.ctx.wireframe = False
 
-        self.geom_program = self._compile_program(
-            _load_shader_source("geometry.vert.glsl"),
-            _load_shader_source("geometry.frag.glsl"),
+        self.geom_program = self.ctx.program(
+            vertex_shader=_load_shader_source("geometry.vert.glsl"),
+            fragment_shader=_load_shader_source("geometry.frag.glsl"),
         )
-        self.post_program = self._compile_program(
-            _load_shader_source("post.vert.glsl"),
-            _load_shader_source("post.frag.glsl"),
+        self.post_program = self.ctx.program(
+            vertex_shader=_load_shader_source("post.vert.glsl"),
+            fragment_shader=_load_shader_source("post.frag.glsl"),
         )
 
-        self.geom_uniforms = {
-            name: gl.glGetUniformLocation(self.geom_program, name)
-            for name in (
-                "uMVP", "uTriTexSize", "uTriTex0", "uTriTex1", "uLevel",
-                "uFaceForwardNormals",
-            )
-        }
-        self.post_uniforms = {
-            name: gl.glGetUniformLocation(self.post_program, name)
-            for name in (
-                "texA", "texB", "texNormal", "texDepth", "uInvMVP",
-                "uRenderMode", "uNearClip", "uFarClip",
-                "uDepthDisplayNear", "uDepthDisplayFar",
-                "W1[0]", "B1[0]", "W2[0]", "B2[0]", "W3[0]", "B3",
-            )
-        }
-
-        self.geom_vao = int(gl.glGenVertexArrays(1))
-        self.position_vbo = int(gl.glGenBuffers(1))
-        self.triangle_id_vbo = int(gl.glGenBuffers(1))
-        self.normal_vbo = int(gl.glGenBuffers(1))
-        self.post_vao = int(gl.glGenVertexArrays(1))
         self._upload_mesh()
-        self.lut_textures = [self._upload_texture(self.scene.lut0), self._upload_texture(self.scene.lut1)]
+        self.post_vao = self.ctx.vertex_array(self.post_program, [])
+        self.lut_textures = []
+        for rgba in (self.scene.lut0, self.scene.lut1):
+            self.lut_textures.append(self._upload_texture(rgba))
+        self.geom_program["uTriTex0"].value = 0
+        self.geom_program["uTriTex1"].value = 1
+        self.geom_program["uTriTexSize"].value = (
+            int(self.scene.lut0.shape[1]),
+            int(self.scene.lut0.shape[0]),
+        )
+        self.geom_program["uLevel"].value = self.scene.level
+        self.post_program["texA"].value = 0
+        self.post_program["texB"].value = 1
+        self.post_program["texNormal"].value = 2
+        self.post_program["texDepth"].value = 3
         self._upload_mlp()
 
-        self.fbo = int(gl.glGenFramebuffers(1))
-        self.color_textures = [int(gl.glGenTextures(1)) for _ in range(3)]
-        self.depth_texture = int(gl.glGenTextures(1))
         width, height = self.glfw.get_framebuffer_size(self.window)
         self._resize_fbo(max(1, width), max(1, height))
 
     def _upload_mesh(self) -> None:
-        gl = self.gl
         positions = np.ascontiguousarray(
             self.scene.verts[self.scene.faces].reshape(-1, 3), dtype=np.float32
         )
@@ -375,197 +384,167 @@ class Viewer:
         )
         self.vertex_count = int(len(positions))
 
-        gl.glBindVertexArray(self.geom_vao)
-        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.position_vbo)
-        gl.glBufferData(gl.GL_ARRAY_BUFFER, positions.nbytes, positions, gl.GL_STATIC_DRAW)
-        gl.glEnableVertexAttribArray(0)
-        gl.glVertexAttribPointer(0, 3, gl.GL_FLOAT, gl.GL_FALSE, 0, ctypes.c_void_p(0))
-
-        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.triangle_id_vbo)
-        gl.glBufferData(
-            gl.GL_ARRAY_BUFFER, triangle_ids.nbytes, triangle_ids, gl.GL_STATIC_DRAW
+        self.position_buffer = self.ctx.buffer(positions.tobytes())
+        self.triangle_id_buffer = self.ctx.buffer(triangle_ids.tobytes())
+        self.normal_buffer = self.ctx.buffer(normals.tobytes())
+        self.geom_vao = self.ctx.vertex_array(
+            self.geom_program,
+            [
+                (self.position_buffer, "3f", "aPos"),
+                (self.triangle_id_buffer, "1u", "aTriID"),
+                (self.normal_buffer, "3f", "aNormal"),
+            ],
         )
-        gl.glEnableVertexAttribArray(1)
-        gl.glVertexAttribIPointer(1, 1, gl.GL_UNSIGNED_INT, 0, ctypes.c_void_p(0))
 
-        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.normal_vbo)
-        gl.glBufferData(gl.GL_ARRAY_BUFFER, normals.nbytes, normals, gl.GL_STATIC_DRAW)
-        gl.glEnableVertexAttribArray(2)
-        gl.glVertexAttribPointer(2, 3, gl.GL_FLOAT, gl.GL_FALSE, 0, ctypes.c_void_p(0))
-        gl.glBindVertexArray(0)
-
-    def _upload_texture(self, rgba: np.ndarray) -> int:
-        gl = self.gl
-        texture = int(gl.glGenTextures(1))
+    def _upload_texture(self, rgba: np.ndarray) -> Any:
         height, width, _ = rgba.shape
-        gl.glBindTexture(gl.GL_TEXTURE_2D, texture)
-        gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1)
-        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST)
-        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST)
-        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE)
-        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE)
-        gl.glTexImage2D(
-            gl.GL_TEXTURE_2D, 0, gl.GL_RGBA8, width, height, 0,
-            gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, rgba,
+        texture = self.ctx.texture(
+            (width, height),
+            4,
+            rgba.tobytes(),
+            alignment=1,
+            dtype="f1",
         )
-        gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+        texture.filter = (self.moderngl.NEAREST, self.moderngl.NEAREST)
+        texture.repeat_x = False
+        texture.repeat_y = False
         return texture
 
     def _upload_mlp(self) -> None:
-        gl = self.gl
-        gl.glUseProgram(self.post_program)
-        gl.glUniformMatrix4fv(
-            self.post_uniforms["W1[0]"], 16, gl.GL_TRUE, _tile_weights(self.scene.w1)
+        self.post_program["W1"].write(
+            _matrix_array_bytes(_tile_weights(self.scene.w1))
         )
-        gl.glUniform4fv(
-            self.post_uniforms["B1[0]"], 4, np.ascontiguousarray(self.scene.b1.reshape(4, 4))
+        self.post_program["B1"].write(self.scene.b1.tobytes())
+        self.post_program["W2"].write(
+            _matrix_array_bytes(_tile_weights(self.scene.w2))
         )
-        gl.glUniformMatrix4fv(
-            self.post_uniforms["W2[0]"], 16, gl.GL_TRUE, _tile_weights(self.scene.w2)
-        )
-        gl.glUniform4fv(
-            self.post_uniforms["B2[0]"], 4, np.ascontiguousarray(self.scene.b2.reshape(4, 4))
-        )
-        gl.glUniformMatrix4fv(
-            self.post_uniforms["W3[0]"], 4, gl.GL_TRUE, _tile_output_weights(self.scene.w3)
+        self.post_program["B2"].write(self.scene.b2.tobytes())
+        self.post_program["W3"].write(
+            _matrix_array_bytes(_tile_output_weights(self.scene.w3))
         )
         b3 = np.array([*self.scene.b3, 0.0], dtype=np.float32)
-        gl.glUniform4fv(self.post_uniforms["B3"], 1, b3)
-        gl.glUseProgram(0)
+        self.post_program["B3"].write(b3.tobytes())
+
+    def _release_geometry_targets(self) -> None:
+        for framebuffer in reversed(self._attachment_clear_fbos):
+            framebuffer.release()
+        self._attachment_clear_fbos = []
+        if self.geometry_fbo is not None:
+            self.geometry_fbo.release()
+            self.geometry_fbo = None
+        if self.depth_texture is not None:
+            self.depth_texture.release()
+            self.depth_texture = None
+        for texture in reversed(self.color_textures):
+            texture.release()
+        self.color_textures = []
 
     def _resize_fbo(self, width: int, height: int) -> None:
-        gl = self.gl
         width, height = max(1, int(width)), max(1, int(height))
         self.camera.width = width
         self.camera.height = height
         self.camera.update()
 
-        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self.fbo)
-        for index, texture in enumerate(self.color_textures):
-            gl.glBindTexture(gl.GL_TEXTURE_2D, texture)
-            gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST)
-            gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST)
-            gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE)
-            gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE)
-            gl.glTexImage2D(
-                gl.GL_TEXTURE_2D, 0, gl.GL_RGBA8, width, height, 0,
-                gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, None,
-            )
-            gl.glFramebufferTexture2D(
-                gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0 + index,
-                gl.GL_TEXTURE_2D, texture, 0,
-            )
-
-        gl.glBindTexture(gl.GL_TEXTURE_2D, self.depth_texture)
-        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST)
-        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST)
-        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE)
-        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE)
-        gl.glTexImage2D(
-            gl.GL_TEXTURE_2D, 0, gl.GL_DEPTH_COMPONENT24, width, height, 0,
-            gl.GL_DEPTH_COMPONENT, gl.GL_UNSIGNED_INT, None,
-        )
-        gl.glFramebufferTexture2D(
-            gl.GL_FRAMEBUFFER, gl.GL_DEPTH_ATTACHMENT,
-            gl.GL_TEXTURE_2D, self.depth_texture, 0,
-        )
-        attachments = [
-            gl.GL_COLOR_ATTACHMENT0 + index
-            for index in range(len(self.color_textures))
+        self._release_geometry_targets()
+        color_textures = [
+            self.ctx.texture((width, height), 4, dtype="f1")
+            for _ in range(3)
         ]
-        gl.glDrawBuffers(len(attachments), attachments)
-        if gl.glCheckFramebufferStatus(gl.GL_FRAMEBUFFER) != gl.GL_FRAMEBUFFER_COMPLETE:
-            raise RuntimeError("geometry framebuffer is incomplete")
-        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
+        depth_texture = self.ctx.depth_texture((width, height))
+        clear_fbos: list[Any] = []
+        geometry_fbo: Any = None
+        try:
+            for texture in color_textures:
+                texture.filter = (self.moderngl.NEAREST, self.moderngl.NEAREST)
+                texture.repeat_x = False
+                texture.repeat_y = False
+            depth_texture.filter = (
+                self.moderngl.NEAREST,
+                self.moderngl.NEAREST,
+            )
+            depth_texture.repeat_x = False
+            depth_texture.repeat_y = False
+            depth_texture.compare_func = ""
+            geometry_fbo = self.ctx.framebuffer(color_textures, depth_texture)
+            clear_fbos = [
+                self.ctx.framebuffer([color_textures[1]]),
+                self.ctx.framebuffer([color_textures[2]]),
+            ]
+        except Exception:
+            for framebuffer in reversed(clear_fbos):
+                framebuffer.release()
+            if geometry_fbo is not None:
+                geometry_fbo.release()
+            depth_texture.release()
+            for texture in reversed(color_textures):
+                texture.release()
+            raise
 
-    def _create_output_fbo(self, width: int, height: int) -> tuple[int, int]:
-        gl = self.gl
-        fbo = int(gl.glGenFramebuffers(1))
-        texture = int(gl.glGenTextures(1))
-        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, fbo)
-        gl.glBindTexture(gl.GL_TEXTURE_2D, texture)
-        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST)
-        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST)
-        gl.glTexImage2D(
-            gl.GL_TEXTURE_2D, 0, gl.GL_RGBA8, width, height, 0,
-            gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, None,
-        )
-        gl.glFramebufferTexture2D(
-            gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0,
-            gl.GL_TEXTURE_2D, texture, 0,
-        )
-        gl.glDrawBuffer(gl.GL_COLOR_ATTACHMENT0)
-        if gl.glCheckFramebufferStatus(gl.GL_FRAMEBUFFER) != gl.GL_FRAMEBUFFER_COMPLETE:
-            raise RuntimeError("benchmark framebuffer is incomplete")
-        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
-        return fbo, texture
+        self.color_textures = color_textures
+        self.depth_texture = depth_texture
+        self.geometry_fbo = geometry_fbo
+        self._attachment_clear_fbos = clear_fbos
 
-    def _render(self, mvp: np.ndarray, *, output_fbo: int = 0) -> None:
-        gl = self.gl
+    def _create_output_fbo(self, width: int, height: int) -> tuple[Any, Any]:
+        texture = self.ctx.texture((int(width), int(height)), 4, dtype="f1")
+        texture.filter = (self.moderngl.NEAREST, self.moderngl.NEAREST)
+        try:
+            framebuffer = self.ctx.framebuffer([texture])
+        except Exception:
+            texture.release()
+            raise
+        return framebuffer, texture
+
+    def _framebuffer_target(self, framebuffer: Any | int | None) -> Any:
+        if framebuffer is None or (
+            isinstance(framebuffer, int) and framebuffer == 0
+        ):
+            return self.ctx.screen
+        return framebuffer
+
+    def _render(self, mvp: np.ndarray, *, output_fbo: Any | int = 0) -> None:
         width, height = self.camera.width, self.camera.height
         mvp = np.ascontiguousarray(mvp, dtype=np.float32)
 
-        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self.fbo)
-        gl.glViewport(0, 0, width, height)
-        gl.glClearBufferfv(
-            gl.GL_COLOR, 0, np.array([*self.background, 1.0], dtype=np.float32)
-        )
-        gl.glClearBufferfv(
-            gl.GL_COLOR, 1, np.array([*self.background, 0.0], dtype=np.float32)
-        )
-        gl.glClearBufferfv(
-            gl.GL_COLOR, 2, np.array([0.5, 0.5, 1.0, 0.0], dtype=np.float32)
-        )
-        gl.glClear(gl.GL_DEPTH_BUFFER_BIT)
-        gl.glEnable(gl.GL_DEPTH_TEST)
-        gl.glDisable(gl.GL_BLEND)
-        gl.glDisable(gl.GL_CULL_FACE)
+        background = tuple(float(value) for value in self.background)
+        self.geometry_fbo.use()
+        self.geometry_fbo.clear(*background, 1.0, depth=1.0)
+        self._attachment_clear_fbos[0].use()
+        self._attachment_clear_fbos[0].clear(*background, 0.0)
+        self._attachment_clear_fbos[1].use()
+        self._attachment_clear_fbos[1].clear(0.5, 0.5, 1.0, 0.0)
+        self.geometry_fbo.use()
+        self.ctx.viewport = (0, 0, width, height)
+        self.ctx.enable_only(self.moderngl.DEPTH_TEST)
+        self.ctx.depth_func = "<"
 
-        gl.glUseProgram(self.geom_program)
-        gl.glUniformMatrix4fv(self.geom_uniforms["uMVP"], 1, gl.GL_TRUE, mvp)
-        gl.glUniform1i(self.geom_uniforms["uTriTex0"], 0)
-        gl.glUniform1i(self.geom_uniforms["uTriTex1"], 1)
-        gl.glUniform2i(
-            self.geom_uniforms["uTriTexSize"],
-            int(self.scene.lut0.shape[1]), int(self.scene.lut0.shape[0]),
-        )
-        gl.glUniform1i(self.geom_uniforms["uLevel"], self.scene.level)
-        gl.glUniform1i(
-            self.geom_uniforms["uFaceForwardNormals"],
-            int(self.normal_orientation is NormalOrientation.FACE_FORWARD),
+        self.geom_program["uMVP"].write(_matrix_bytes(mvp))
+        self.geom_program["uFaceForwardNormals"].value = (
+            self.normal_orientation is NormalOrientation.FACE_FORWARD
         )
         for unit, texture in enumerate(self.lut_textures):
-            gl.glActiveTexture(gl.GL_TEXTURE0 + unit)
-            gl.glBindTexture(gl.GL_TEXTURE_2D, texture)
-        gl.glBindVertexArray(self.geom_vao)
-        gl.glDrawArrays(gl.GL_TRIANGLES, 0, self.vertex_count)
-        gl.glBindVertexArray(0)
+            texture.use(unit)
+        self.geom_vao.render(
+            mode=self.moderngl.TRIANGLES,
+            vertices=self.vertex_count,
+        )
 
-        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, output_fbo)
-        gl.glViewport(0, 0, width, height)
-        gl.glDisable(gl.GL_DEPTH_TEST)
-        gl.glUseProgram(self.post_program)
-        gl.glUniform1i(self.post_uniforms["texA"], 0)
-        gl.glUniform1i(self.post_uniforms["texB"], 1)
-        gl.glUniform1i(self.post_uniforms["texNormal"], 2)
-        gl.glUniform1i(self.post_uniforms["texDepth"], 3)
-        gl.glUniform1i(self.post_uniforms["uRenderMode"], int(self.render_mode))
-        gl.glUniform1f(self.post_uniforms["uNearClip"], self.camera.near_clip)
-        gl.glUniform1f(self.post_uniforms["uFarClip"], self.camera.far_clip)
+        target = self._framebuffer_target(output_fbo)
+        target.use()
+        self.ctx.viewport = (0, 0, width, height)
+        self.ctx.disable(self.moderngl.DEPTH_TEST)
+        self.post_program["uRenderMode"].value = int(self.render_mode)
+        self.post_program["uNearClip"].value = self.camera.near_clip
+        self.post_program["uFarClip"].value = self.camera.far_clip
         display_near, display_far = self._resolve_depth_range(mvp)
-        gl.glUniform1f(self.post_uniforms["uDepthDisplayNear"], display_near)
-        gl.glUniform1f(self.post_uniforms["uDepthDisplayFar"], display_far)
+        self.post_program["uDepthDisplayNear"].value = display_near
+        self.post_program["uDepthDisplayFar"].value = display_far
         for unit, texture in enumerate(self.color_textures):
-            gl.glActiveTexture(gl.GL_TEXTURE0 + unit)
-            gl.glBindTexture(gl.GL_TEXTURE_2D, texture)
-        gl.glActiveTexture(gl.GL_TEXTURE3)
-        gl.glBindTexture(gl.GL_TEXTURE_2D, self.depth_texture)
+            texture.use(unit)
+        self.depth_texture.use(3)
         inverse = np.ascontiguousarray(np.linalg.inv(mvp), dtype=np.float32)
-        gl.glUniformMatrix4fv(self.post_uniforms["uInvMVP"], 1, gl.GL_TRUE, inverse)
-        gl.glBindVertexArray(self.post_vao)
-        gl.glDrawArrays(gl.GL_TRIANGLES, 0, 3)
-        gl.glBindVertexArray(0)
-        gl.glUseProgram(0)
+        self.post_program["uInvMVP"].write(_matrix_bytes(inverse))
+        self.post_vao.render(mode=self.moderngl.TRIANGLES, vertices=3)
 
     def _resolve_depth_range(self, mvp: np.ndarray) -> tuple[float, float]:
         near_clip = float(self.camera.near_clip)
@@ -730,25 +709,41 @@ class Viewer:
         if self.imgui_renderer:
             self.imgui_renderer.char_callback(window, codepoint)
 
-    def _read_pixels(self, framebuffer: int) -> np.ndarray:
-        gl = self.gl
-        gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, framebuffer)
-        gl.glReadBuffer(gl.GL_COLOR_ATTACHMENT0 if framebuffer else gl.GL_BACK)
-        gl.glPixelStorei(gl.GL_PACK_ALIGNMENT, 1)
-        pixels = gl.glReadPixels(
-            0, 0, self.camera.width, self.camera.height, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE
+    def _read_pixels(self, framebuffer: Any | int = 0) -> np.ndarray:
+        capture_fbo = None
+        capture_texture = None
+        is_screen = framebuffer is None or (
+            isinstance(framebuffer, int) and framebuffer == 0
         )
+        try:
+            if is_screen:
+                capture_fbo, capture_texture = self._create_output_fbo(
+                    self.camera.width, self.camera.height
+                )
+                self.ctx.copy_framebuffer(capture_fbo, self.ctx.screen)
+                target = capture_fbo
+            else:
+                target = framebuffer
+            pixels = target.read(
+                viewport=(0, 0, self.camera.width, self.camera.height),
+                components=4,
+                alignment=1,
+            )
+        finally:
+            if capture_fbo is not None:
+                capture_fbo.release()
+            if capture_texture is not None:
+                capture_texture.release()
         image = np.frombuffer(pixels, dtype=np.uint8).reshape(
             self.camera.height, self.camera.width, 4
         )
-        gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, 0)
         return np.flipud(image).copy()
 
     def save_screenshot(
         self,
         path: str | Path | None = None,
         *,
-        framebuffer: int = 0,
+        framebuffer: Any | int = 0,
     ) -> Path:
         from PIL import Image
 
@@ -805,16 +800,16 @@ class Viewer:
             first_mvp = np.ascontiguousarray(mvps[0].T)
             for _ in range(max(0, warmup)):
                 self._render(first_mvp, output_fbo=output_fbo)
-            self.gl.glFinish()
+            self.ctx.finish()
 
             times_ms: list[float] = []
             for index, payload in enumerate(mvps):
                 mvp = np.ascontiguousarray(payload.T)
-                self.gl.glFinish()
+                self.ctx.finish()
                 started = time.perf_counter()
                 for _ in range(repeat):
                     self._render(mvp, output_fbo=output_fbo)
-                self.gl.glFinish()
+                self.ctx.finish()
                 elapsed_ms = (time.perf_counter() - started) * 1000.0 / repeat
                 times_ms.append(elapsed_ms)
                 self.glfw.poll_events()
@@ -846,8 +841,37 @@ class Viewer:
                 )
             return summary
         finally:
-            self.gl.glDeleteTextures(1, [output_texture])
-            self.gl.glDeleteFramebuffers(1, [output_fbo])
+            output_fbo.release()
+            output_texture.release()
+
+    def _release_gl_resources(self) -> None:
+        if self.ctx is None:
+            return
+        self._release_geometry_targets()
+        for texture in reversed(self.lut_textures):
+            texture.release()
+        self.lut_textures = []
+        for name in ("post_vao", "geom_vao"):
+            resource = getattr(self, name)
+            if resource is not None:
+                resource.release()
+                setattr(self, name, None)
+        for name in (
+            "normal_buffer",
+            "triangle_id_buffer",
+            "position_buffer",
+        ):
+            resource = getattr(self, name)
+            if resource is not None:
+                resource.release()
+                setattr(self, name, None)
+        for name in ("post_program", "geom_program"):
+            resource = getattr(self, name)
+            if resource is not None:
+                resource.release()
+                setattr(self, name, None)
+        self.ctx.release()
+        self.ctx = None
 
     def close(self) -> None:
         if self._closed:
@@ -857,9 +881,11 @@ class Viewer:
             self.glfw.make_context_current(self.window)
             if self.imgui_renderer is not None:
                 self.imgui_renderer.shutdown()
+                self.imgui_renderer = None
             if self.imgui_context is not None:
                 self.imgui.destroy_context(self.imgui_context)
                 self.imgui_context = None
+            self._release_gl_resources()
             self.glfw.destroy_window(self.window)
             self.window = None
         self.glfw.terminate()

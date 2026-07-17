@@ -1,7 +1,8 @@
 # DiffSoup Python Viewer
 
-This directory reimplements the native `viewer/` package in Python while
-preserving its rendering contract:
+This directory reimplements the native `viewer/` package in Python with GLFW
+for window/input handling and ModernGL for OpenGL resources and draw calls,
+while preserving the native rendering contract:
 
 - a geometry pass interpolates the level-⁠`Rmax` triangle LUT and applies the
   deterministic `alpha >= 0.5` mask;
@@ -21,7 +22,7 @@ preserving its rendering contract:
 ## Install and Run
 
 ```bash
-pip install numpy torch glfw PyOpenGL imgui Pillow
+pip install numpy torch glfw moderngl PyOpenGL imgui Pillow
 python -m py_viewer.cli \
   --ckpt results/02_synthetic/lego/final_params.pt \
   --mode normal \
@@ -69,4 +70,6 @@ column-major MVP payload used by `diffsoupviewer.benchmark`. It writes
 
 The Python version favors inspectability over minimum CPU overhead. Rendering
 remains GPU-backed and uses the same RGBA8 LUT quantization as the native and
-web viewers.
+web viewers. PyOpenGL remains an interactive-only transitive requirement of
+the current pyimgui GLFW renderer; the DiffSoup render path itself uses
+ModernGL.
