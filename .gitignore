@@ -218,6 +218,8 @@ datasets/
 tests/
 /tests/
 /tests/**
+!/tests/
+!/tests/test_regularization.py
 
 paper/
 tmp/

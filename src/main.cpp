@@ -2,6 +2,7 @@
 // Nanobind module definition for the DiffSoup CUDA extension (_core).
 
 #include <cstdio>
+#include <cstdint>
 #include <vector>
 #include <stdexcept>
 #include <numeric>
@@ -70,20 +71,25 @@ NB_MODULE(_core, m)
         nb::ndarray<int32_t,  nb::pytorch, nb::shape<-1, 3>,     nb::c_contig> tri,
         nb::ndarray<int32_t,  nb::pytorch, nb::shape<-1, 4>,     nb::c_contig> triangle_rects,
         nb::ndarray<int32_t,  nb::pytorch, nb::shape<-1>,        nb::c_contig> frag_prefix_sum,
+        nb::ndarray<int32_t,  nb::pytorch, nb::shape<2>,         nb::c_contig> triangle_stats,
         uintptr_t stream_handle
-    ) -> int {
+    ) {
         CudaDeviceGuard device_guard(pos.device_id());
         const int B = static_cast<int>(pos.shape(0));
         const int V = static_cast<int>(pos.shape(1));
         const int T = static_cast<int>(tri.shape(0));
 
-        return ds::cuda::compute_triangle_rects(
+        const auto stats = ds::cuda::compute_triangle_rects(
             H, W, B,
             V, pos.data(),
             T, tri.data(),
             triangle_rects.data(),
             frag_prefix_sum.data(),
+            triangle_stats.data(),
             stream_from_handle(stream_handle)
+        );
+        return nb::make_tuple(
+            stats.num_frags, stats.active_triangles, stats.max_candidates
         );
     }, "Compute screen-space bounding rectangles and fragment prefix sums for each triangle.");
 
@@ -95,6 +101,8 @@ NB_MODULE(_core, m)
         nb::ndarray<int32_t,  nb::pytorch, nb::shape<-1, 4>,         nb::c_contig> triangle_rects,
         nb::ndarray<int32_t,  nb::pytorch, nb::shape<-1, 3>,         nb::c_contig> frag_pix,
         nb::ndarray<float,    nb::pytorch, nb::shape<-1, 4>,         nb::c_contig> frag_attrs,
+        int active_triangles,
+        int max_candidates,
         uintptr_t stream_handle
     ) {
         const int B = static_cast<int>(pos.shape(0));
@@ -110,6 +118,8 @@ NB_MODULE(_core, m)
             T, tri.data(),
             num_tris,
             num_frags,
+            active_triangles,
+            max_candidates,
             frag_prefix_sum.data(),
             triangle_rects.data(),
             frag_pix.data(),
@@ -141,6 +151,30 @@ NB_MODULE(_core, m)
         );
     }, "Resolve fragment visibility via z-buffer depth test.");
 
+    m.def("depth_test_counter_rng", [](
+        nb::ndarray<int32_t, nb::pytorch, nb::shape<-1, 3>,  nb::c_contig> frag_pix,
+        nb::ndarray<float,   nb::pytorch, nb::shape<-1, 4>,  nb::c_contig> frag_attrs,
+        nb::ndarray<float,   nb::pytorch, nb::shape<-1>,     nb::c_contig> frag_alpha,
+        uint64_t rng_seed,
+        uint64_t rng_counter,
+        nb::ndarray<int64_t, nb::pytorch, nb::shape<-1, -1, -1>,     nb::c_contig> frag_index,
+        nb::ndarray<float,   nb::pytorch, nb::shape<-1, -1, -1, 4>,  nb::c_contig> rast_out,
+        uintptr_t stream_handle
+    ) {
+        const int num_frags = static_cast<int>(frag_pix.shape(0));
+        const int B = static_cast<int>(rast_out.shape(0));
+        const int H = static_cast<int>(rast_out.shape(1));
+        const int W = static_cast<int>(rast_out.shape(2));
+
+        CudaDeviceGuard device_guard(rast_out.device_id());
+        ds::cuda::depth_test_counter_rng(
+            B, H, W, num_frags, frag_pix.data(), frag_attrs.data(),
+            frag_alpha.data(), rng_seed, rng_counter,
+            reinterpret_cast<long long*>(frag_index.data()), rast_out.data(),
+            stream_from_handle(stream_handle)
+        );
+    }, "Resolve visibility with stateless per-fragment Philox thresholds.");
+
     m.def("count_valid_fragments", [](
         nb::ndarray<int32_t, nb::pytorch, nb::shape<-1, 3>, nb::c_contig> frag_pix,
         nb::ndarray<int32_t, nb::pytorch, nb::shape<1>,     nb::c_contig> counter,
@@ -171,6 +205,25 @@ NB_MODULE(_core, m)
             stream_from_handle(stream_handle)
         );
     }, "Compact valid fragments into caller-provided exact-size buffers.");
+
+    m.def("build_pixel_fragment_csr", [](
+        int B,
+        int H,
+        int W,
+        nb::ndarray<int32_t, nb::pytorch, nb::shape<-1, 3>, nb::c_contig> frag_pix,
+        nb::ndarray<int32_t, nb::pytorch, nb::shape<-1>,    nb::c_contig> pixel_offsets,
+        nb::ndarray<int32_t, nb::pytorch, nb::shape<-1>,    nb::c_contig> pixel_cursors,
+        nb::ndarray<int32_t, nb::pytorch, nb::shape<-1>,    nb::c_contig> fragment_indices,
+        uintptr_t stream_handle
+    ) {
+        const int num_frags = static_cast<int>(frag_pix.shape(0));
+        CudaDeviceGuard device_guard(frag_pix.device_id());
+        ds::cuda::build_pixel_fragment_csr(
+            B, H, W, num_frags, frag_pix.data(), pixel_offsets.data(),
+            pixel_cursors.data(), fragment_indices.data(),
+            stream_from_handle(stream_handle)
+        );
+    }, "Build a pixel-to-fragment CSR index on the current CUDA stream.");
 
     // ── Edge gradients ──────────────────────────────────────────────
 

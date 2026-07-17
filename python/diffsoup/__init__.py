@@ -9,6 +9,8 @@ from . import _core
 from . import optimize
 
 from .rasterize import (
+    PixelFragmentCSR,
+    build_pixel_fragment_csr,
     edge_grad,
     opacity_aux_loss,
     encode_view_dir_sh2,

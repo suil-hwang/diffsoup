@@ -2,7 +2,7 @@
 """Software rasterisation, edge-gradient computation, and view-direction encoding."""
 
 import torch
-from typing import Tuple
+from typing import NamedTuple, Tuple
 
 from . import _core
 
@@ -75,19 +75,66 @@ def _compute_fragments(
 
     rects = torch.empty((B * T, 4), dtype=torch.int32, device=device)
     frag_prefix = torch.empty(B * T, dtype=torch.int32, device=device)
+    triangle_stats = torch.empty(2, dtype=torch.int32, device=device)
     stream = _cuda_stream(pos)
-    num_frags = _core.compute_triangle_rects(
-        H, W, pos, tri, rects, frag_prefix, stream
+    num_frags, active_triangles, max_candidates = _core.compute_triangle_rects(
+        H, W, pos, tri, rects, frag_prefix, triangle_stats, stream
     )
 
     frag_pix = torch.empty((num_frags, 3), dtype=torch.int32, device=device)
     frag_attrs = torch.empty((num_frags, 4), dtype=torch.float32, device=device)
 
     _core.compute_fragments(
-        H, W, pos, tri, frag_prefix, rects, frag_pix, frag_attrs, stream
+        H, W, pos, tri, frag_prefix, rects, frag_pix, frag_attrs,
+        active_triangles, max_candidates, stream,
     )
 
     return _filter_valid_fragments(frag_pix, frag_attrs)
+
+
+class PixelFragmentCSR(NamedTuple):
+    """Pixel-to-fragment compressed sparse row index."""
+
+    pixel_offsets: torch.Tensor
+    fragment_indices: torch.Tensor
+
+
+def build_pixel_fragment_csr(
+    frag_pix: torch.Tensor,
+    batch_size: int,
+    image_size: Tuple[int, int],
+) -> PixelFragmentCSR:
+    """Build an opt-in pixel-to-fragment CSR index on the current stream.
+
+    ``pixel_offsets`` has ``batch_size * H * W + 1`` entries; the fragments
+    for flattened pixel ``p`` are ``fragment_indices[offsets[p]:offsets[p+1]]``.
+    Invalid fragment rows are omitted, and order inside each segment is not
+    defined.
+    """
+    height, width = image_size
+    assert frag_pix.ndim == 2 and frag_pix.shape[-1] == 3
+    assert frag_pix.dtype == torch.int32 and frag_pix.is_contiguous()
+    assert frag_pix.is_cuda
+    assert batch_size >= 0 and height > 0 and width > 0
+    total_pixels = batch_size * height * width
+    int32_max = torch.iinfo(torch.int32).max
+    assert total_pixels < int32_max and frag_pix.shape[0] <= int32_max
+
+    pixel_offsets = torch.empty(
+        total_pixels + 1, dtype=torch.int32, device=frag_pix.device,
+    )
+    pixel_cursors = torch.empty(
+        total_pixels, dtype=torch.int32, device=frag_pix.device,
+    )
+    fragment_indices = torch.empty(
+        frag_pix.shape[0], dtype=torch.int32, device=frag_pix.device,
+    )
+    _core.build_pixel_fragment_csr(
+        batch_size, height, width, frag_pix,
+        pixel_offsets, pixel_cursors, fragment_indices,
+        _cuda_stream(frag_pix),
+    )
+    return PixelFragmentCSR(pixel_offsets, fragment_indices)
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +186,41 @@ def _depth_test(
     rast = torch.empty(B, H, W, 4, dtype=torch.float32, device=device)
     _core.depth_test(
         frag_pix, frag_attrs, frag_alpha, alpha_thresh,
+        frag_index, rast, _cuda_stream(pos),
+    )
+    return rast
+
+
+def _depth_test_counter_rng(
+    resolution: Tuple[int, int],
+    pos: torch.Tensor,
+    frag_pix: torch.Tensor,
+    frag_attrs: torch.Tensor,
+    frag_alpha: torch.Tensor,
+    rng_seed: int,
+    rng_counter: int,
+) -> torch.Tensor:
+    """Resolve visibility with stateless per-fragment Philox thresholds."""
+    H, W = resolution
+    B, V, _ = pos.shape
+    num_frags, _ = frag_pix.shape
+    device = pos.device
+
+    assert pos.shape == (B, V, 4) and pos.dtype == torch.float32 and pos.is_contiguous()
+    assert frag_pix.shape == (num_frags, 3) and frag_pix.dtype == torch.int32 and frag_pix.is_contiguous()
+    assert frag_attrs.shape == (num_frags, 4) and frag_attrs.dtype == torch.float32 and frag_attrs.is_contiguous()
+    assert frag_alpha.shape == (num_frags,) and frag_alpha.dtype == torch.float32 and frag_alpha.is_contiguous()
+    assert pos.is_cuda
+    assert frag_pix.device == device
+    assert frag_attrs.device == device
+    assert frag_alpha.device == device
+    assert 0 <= rng_seed < 1 << 64
+    assert 0 <= rng_counter < 1 << 64
+
+    frag_index = torch.empty(B, H, W, dtype=torch.int64, device=device)
+    rast = torch.empty(B, H, W, 4, dtype=torch.float32, device=device)
+    _core.depth_test_counter_rng(
+        frag_pix, frag_attrs, frag_alpha, rng_seed, rng_counter,
         frag_index, rast, _cuda_stream(pos),
     )
     return rast

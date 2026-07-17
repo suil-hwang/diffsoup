@@ -10,8 +10,12 @@ training entry points are:
 - `examples/01_mip360.py`: the baseline COLMAP/MipNeRF-360 trainer.
 - `examples/02_mip360_test.py`: the current MipNeRF-360 experimental trainer.
   It adds a separately controlled LR schedule horizon, a nonempty-output guard,
-  a configurable target face count, detailed loss telemetry, and optional ARAG
-  depth/normal priors. Despite the `_test` suffix, this is a full trainer.
+  a configurable target face count, detailed loss telemetry, and fixed-weight
+  ARAG depth/normal supervision. Despite the `_test` suffix, this is a full
+  trainer.
+- `examples/02_mip360_test_profile.py`: the matching profiling trainer. It keeps
+  training behavior aligned with `02_mip360_test.py`, always disables tqdm, and
+  writes per-step CUDA/wall/memory telemetry to `train_profile.jsonl`.
 - `examples/03_random_init.py`: random point/triangle initialization for
   NeRF-Synthetic-style scenes; there is currently no tracked mesh-initialized
   synthetic trainer.
@@ -117,10 +121,12 @@ directory unless `--overwrite` is explicit. `01_mip360.py` and
 `03_random_init.py` do not provide that overwrite guard, so always use a fresh
 ignored `--out_dir` for validation.
 
-Geometry priors are disabled by default; either prior weight must be positive
-to activate them in `02_mip360_test.py`. The defaults start supervision at
-step 5,501, ramp for 500 steps, and sample 16,384 pixels per selected view.
-The prior data contract is:
+Geometry priors are active in `02_mip360_test.py` through fixed positive code
+constants, so the current trainer loads both depth and normal data at startup.
+There are no lambda/weight CLI options or compatibility aliases. Depth starts
+at iteration 1 and decays over `schedule_steps`; normal starts at iteration
+5,501, ramps for 500 steps, and both modalities sample 16,384 pixels per
+selected view by default. The prior data contract is:
 
 - `depth/<view-stem>.png`: uint16 encoded inverse camera-Z;
 - `normals/` for full resolution or `normals_<downscale>/`: uint8 camera-space
@@ -154,8 +160,9 @@ camera-Z, so sub-opaque coverage cannot move a single surface to
 opacity-weighted expectation of per-fragment angular error; this removes the
 unoptimizable `1 - opacity` floor without opening an alpha gradient. Normal and
 depth losses both exclude missing surfaces while retaining the full
-sampled-row denominator. The experimental trainer loads only enabled prior
-modalities and, at the first active step and every 100 steps thereafter,
+sampled-row denominator. With the current fixed positive constants, the
+experimental trainer loads both prior modalities and, at the first active step
+and every 100 steps thereafter,
 records separate hit fractions, accumulated-opacity q10/q50/q90 and fractions
 above 0.5/0.9, normal concentration/cosine, and prior-specific vertex-gradient
 norms. Depth supervision starts at iteration 1 and log-linearly decays from the
@@ -163,7 +170,8 @@ fixed `LAMBDA_DEPTH_PRIOR_INITIAL = 0.01` to
 `LAMBDA_DEPTH_PRIOR_FINAL = 0.001` over `schedule_steps`. Normal supervision
 uses the fixed `LAMBDA_NORMAL_PRIOR = 0.01`, remains disabled until
 `normal_prior_start`, and then linearly ramps over `normal_prior_ramp_steps`.
-The three lambda values are code constants, not CLI options.
+The three lambda values are code constants, not CLI options; do not document
+the removed `--lambda_*` options or the former `--*_prior_weight` aliases.
 
 ## Environment, Build, and Smoke Commands
 
@@ -205,10 +213,11 @@ Representative workflows are:
 
 ```bash
 python examples/01_mip360.py --scene_root ./datasets/360_v2/garden --out_dir ./results/smoke_01_garden
-python examples/02_mip360_test.py --scene_root ./datasets/360_v2/garden --steps 20 --schedule_steps 10000 --out_dir ./results/smoke_02_garden
 python examples/03_random_init.py --scene lego --out_dir ./results/smoke_03_lego
 python examples/08_prepare_geometry_priors.py --scene-root ./datasets/360_v2/garden
+python examples/02_mip360_test.py --scene_root ./datasets/360_v2/garden --steps 20 --schedule_steps 10000 --out_dir ./results/smoke_02_garden
 python examples/02_mip360_test.py --scene_root ./datasets/360_v2/garden --out_dir ./results/02_mip360/garden_arag
+python examples/02_mip360_test_profile.py --scene_root ./datasets/360_v2/garden --out_dir ./results/profile_02_garden
 python -m pip install -v viewer/
 python examples/04_view_results.py --ckpt results/02_mip360/garden_arag/final_params.pt
 ```
@@ -302,23 +311,30 @@ mode before comparing screenshots or hashes across surfaces.
 
 ## Testing, Profiling, and Validation
 
-There is no committed automated test suite or coverage threshold. `tests/` is
-ignored and can be invisible to ordinary `rg --files`; inspect it with
-`Get-ChildItem tests` or `rg --no-ignore --files tests`. A new test intended for
-review must be deliberately unignored and confirmed in `git status`.
+`tests/test_regularization.py` is the tracked expected-surface and
+geometry-regularization regression file. There is no configured coverage
+threshold. `.gitignore` explicitly unignores this tracked file while other
+`tests/` contents remain ignored, so local tests can be invisible to ordinary
+`rg --files`; inspect them with
+`Get-ChildItem tests` or `rg --no-ignore --files tests`, and use
+`git ls-files tests` to distinguish committed coverage from local-only files.
+A new test intended for review must be deliberately force-added or unignored
+and then confirmed in `git status`.
 
-The ignored local tests are development-only and must not be treated as
-committed coverage. The current focused geometry-prior files are aligned with
-the implementation and cover conditional depth, missing-surface masking,
-fixed-fragment gradients, per-view reliability, optional modality loading, and
-COLMAP half-pixel coordinates. Do not treat stale `.pyc` files as source. Run
-focused checks before using the broader local snapshot as a gate:
+Ignored local tests are development-only and must not be treated as committed
+coverage. The current local geometry-prior checks cover conditional depth,
+missing-surface masking, fixed-fragment gradients, per-view reliability,
+optional modality loading, schedule endpoints, removed CLI options, and COLMAP
+half-pixel coordinates. Do not treat stale `.pyc` files as source. Run the
+tracked test first, then any relevant ignored local checks that are present:
 
 ```bash
+python -m pytest -q -p no:cacheprovider tests/test_regularization.py
+# Additional ignored local checks, when present:
 python -m pytest -q -p no:cacheprovider tests/test_cuda_optimizations.py
-python -m pytest -q -p no:cacheprovider tests/test_regularization.py tests/test_geometry_priors.py
+python -m pytest -q -p no:cacheprovider tests/test_geometry_priors.py
 python -m compileall -q python py_viewer examples
-pyrefly check --python-interpreter-path <activated-python> examples/utils.py examples/01_mip360.py examples/02_mip360_test.py examples/03_random_init.py examples/08_prepare_geometry_priors.py py_viewer
+pyrefly check --python-interpreter-path <activated-python> examples/utils.py examples/01_mip360.py examples/02_mip360_test.py examples/02_mip360_test_profile.py examples/03_random_init.py examples/08_prepare_geometry_priors.py py_viewer
 python examples/00_version.py
 ```
 
@@ -327,6 +343,12 @@ checking the source `python/diffsoup` package currently reports the generated
 `diffsoup._core` module as missing because no source stub is present; use
 `compileall` plus the focused runtime tests for that package until a stub or
 type-checker mapping is added.
+
+Because depth is active from iteration 1, a short default `02_mip360_test.py`
+run exercises the depth path but not the default normal start at iteration
+5,501. For a joint wiring smoke test only, use a fresh ignored output directory
+and pass `--normal_prior_start 1 --normal_prior_ramp_steps 0`; do not change the
+fixed lambda constants merely to make a smoke run shorter.
 
 CUDA changes must cover representative levels and feature dimensions, empty
 geometry, exact/tolerance-based forward and backward parity, cached fragment
@@ -343,8 +365,12 @@ batch size, peak allocated memory, and full hardware/software details. For the
 garden workload, benchmark forward plus backward at B1, B2, and B4. Windows
 WDDM slowdown can appear only after the step-5,000 level lift, so run a separate
 ignored garden B4 output through at least step 5,400 before claiming long-run
-stability. Use Nsight Compute on a small targeted workload for occupancy,
-memory traffic, launch overhead, or initialization analysis.
+stability. `02_mip360_test_profile.py` disables tqdm output and writes
+`train_profile.jsonl` with every-step wall time, sampled CUDA phase events, and
+allocator snapshots at schedule boundaries. Keep profiling work in that
+dedicated script so its synchronization and I/O cannot affect normal runs. Use
+Nsight Compute on a small targeted workload for
+occupancy, memory traffic, launch overhead, or initialization analysis.
 
 Rendering changes require a real OpenGL context and a trusted representative
 checkpoint, not shader-text inspection alone. Capture before/after images or

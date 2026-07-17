@@ -9,12 +9,19 @@
 namespace diffsoup {
 namespace cuda {
 
-int compute_triangle_rects(
+struct TriangleRectStats {
+    int num_frags;
+    int active_triangles;
+    int max_candidates;
+};
+
+TriangleRectStats compute_triangle_rects(
     int H, int W, int B,
     int V, const float* pos,     // [B * V][4]
     int T, const int* tri,       // [T][3]
     int* triangle_rects,         // [B * T][4]: h0, h_len, w0, w_len
     int* frag_prefix_sum,        // [B * T]
+    int* triangle_stats,         // [2]: active triangles, max candidates
     cudaStream_t stream
 );
 
@@ -24,6 +31,8 @@ void compute_fragments(
     int T, const int* tri,
     int num_tris,
     int num_frags,
+    int active_triangles,
+    int max_candidates,
     const int* frag_prefix_sum,
     const int* triangle_rects,
     int* frag_pix,
@@ -43,6 +52,19 @@ void depth_test(
     cudaStream_t stream
 );
 
+void depth_test_counter_rng(
+    int B, int H, int W,
+    int num_frags,
+    const int* frag_pix,       // [num_frags, 3]
+    const float* frag_attrs,   // [num_frags, 4]
+    const float* frag_alpha,   // [num_frags]
+    unsigned long long rng_seed,
+    unsigned long long rng_counter,
+    long long* frag_index,     // [B, H, W] workspace
+    float* rast_out,           // [B, H, W, 4]
+    cudaStream_t stream
+);
+
 int count_valid_fragments(
     int num_frags,
     const int* frag_pix,         // [num_frags, 3]
@@ -57,6 +79,16 @@ void compact_valid_fragments(
     int* frag_pix_out,           // [num_frags, 3]
     float* frag_attrs_out,       // [num_frags, 4]
     int* global_counter,         // [1] workspace
+    cudaStream_t stream
+);
+
+void build_pixel_fragment_csr(
+    int B, int H, int W,
+    int num_frags,
+    const int* frag_pix,         // [num_frags, 3]
+    int* pixel_offsets,          // [B * H * W + 1]
+    int* pixel_cursors,          // [B * H * W] scratch
+    int* fragment_indices,       // [num_frags]
     cudaStream_t stream
 );
 

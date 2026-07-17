@@ -238,6 +238,7 @@ def vertex_expected_surface_samples(
     pixels_b_y_x: torch.Tensor,
     image_size: Tuple[int, int],
     *,
+    pixel_fragment_csr: Tuple[torch.Tensor, torch.Tensor] | None = None,
     eps: float = 1e-8,
     parallel_cos_eps: float = 1e-3,
 ) -> VertexExpectedSurfaceSamples:
@@ -257,6 +258,8 @@ def vertex_expected_surface_samples(
         Tcw:          World-to-camera transforms ``(B, 4, 4)``.
         pixels_b_y_x: Sampled pixels ``(S, 3)`` — ``(batch, y, x)``.
         image_size:   ``(height, width)`` of the raster.
+        pixel_fragment_csr: Optional ``(pixel_offsets, fragment_indices)``
+                     index from :func:`build_pixel_fragment_csr`.
         eps:          Degeneracy floor for depth and opacity.
         parallel_cos_eps: Minimum ray/plane ``|cos|`` before rejection.
 
@@ -335,39 +338,98 @@ def vertex_expected_surface_samples(
     )
 
     # Match raster fragments whose pixel key appears in the sample set.
-    detached_frag_pix = frag_pix.detach().to(torch.int64)
-    frag_in_bounds = (
-        (detached_frag_pix[:, 0] >= 0)
-        & (detached_frag_pix[:, 0] < batch_size)
-        & (detached_frag_pix[:, 1] >= 0)
-        & (detached_frag_pix[:, 1] < height)
-        & (detached_frag_pix[:, 2] >= 0)
-        & (detached_frag_pix[:, 2] < width)
-    )
-    frag_keys = (
-        detached_frag_pix[:, 0] * (height * width)
-        + detached_frag_pix[:, 1] * width
-        + detached_frag_pix[:, 2]
-    )
     detached_raster_depth = frag_attrs[:, 2].detach()
-    raster_depth_valid = (
-        torch.isfinite(detached_raster_depth) & (detached_raster_depth > -1.0)
-    )
-    positions = torch.searchsorted(unique_keys, frag_keys)
-    safe_positions = positions.clamp_max(unique_keys.shape[0] - 1)
-    selected = (
-        frag_in_bounds
-        & raster_depth_valid
-        & (positions < unique_keys.shape[0])
-        & (unique_keys[safe_positions] == frag_keys)
-    )
-    fragment_indices = torch.nonzero(selected, as_tuple=False).squeeze(-1)
-    if fragment_indices.numel() == 0:
-        return empty_result()
+    if pixel_fragment_csr is None:
+        detached_frag_pix = frag_pix.detach().to(torch.int64)
+        frag_in_bounds = (
+            (detached_frag_pix[:, 0] >= 0)
+            & (detached_frag_pix[:, 0] < batch_size)
+            & (detached_frag_pix[:, 1] >= 0)
+            & (detached_frag_pix[:, 1] < height)
+            & (detached_frag_pix[:, 2] >= 0)
+            & (detached_frag_pix[:, 2] < width)
+        )
+        frag_keys = (
+            detached_frag_pix[:, 0] * (height * width)
+            + detached_frag_pix[:, 1] * width
+            + detached_frag_pix[:, 2]
+        )
+        raster_depth_valid = (
+            torch.isfinite(detached_raster_depth)
+            & (detached_raster_depth > -1.0)
+        )
+        positions = torch.searchsorted(unique_keys, frag_keys)
+        safe_positions = positions.clamp_max(unique_keys.shape[0] - 1)
+        selected = (
+            frag_in_bounds
+            & raster_depth_valid
+            & (positions < unique_keys.shape[0])
+            & (unique_keys[safe_positions] == frag_keys)
+        )
+        fragment_indices = torch.nonzero(
+            selected, as_tuple=False,
+        ).squeeze(-1)
+        if fragment_indices.numel() == 0:
+            return empty_result()
+        groups = positions[fragment_indices]
+        fragment_pixels = detached_frag_pix[fragment_indices]
+    else:
+        pixel_offsets, csr_fragment_indices = pixel_fragment_csr
+        total_pixels = batch_size * height * width
+        assert pixel_offsets.shape == (total_pixels + 1,)
+        assert csr_fragment_indices.shape == (frag_pix.shape[0],)
+        assert pixel_offsets.dtype in (torch.int32, torch.int64)
+        assert csr_fragment_indices.dtype in (torch.int32, torch.int64)
+        assert pixel_offsets.device == device
+        assert csr_fragment_indices.device == device
 
-    # Recompute live geometry while preserving raster visibility data.
-    groups = positions[fragment_indices]
-    fragment_pixels = detached_frag_pix[fragment_indices]
+        starts = pixel_offsets.detach()[unique_keys].to(torch.int64)
+        ends = pixel_offsets.detach()[unique_keys + 1].to(torch.int64)
+        counts = ends - starts
+        selected_count = int(counts.sum().item())
+        if selected_count == 0:
+            return empty_result()
+
+        unique_groups = torch.arange(
+            unique_keys.shape[0], dtype=torch.int64, device=device,
+        )
+        groups = torch.repeat_interleave(
+            unique_groups, counts, output_size=selected_count,
+        )
+        group_output_starts = torch.cumsum(counts, dim=0) - counts
+        flat_positions = torch.arange(
+            selected_count, dtype=torch.int64, device=device,
+        )
+        csr_positions = (
+            starts[groups]
+            + flat_positions
+            - group_output_starts[groups]
+        )
+        fragment_indices = csr_fragment_indices.detach()[
+            csr_positions
+        ].to(torch.int64)
+        fragment_index_valid = (
+            (fragment_indices >= 0)
+            & (fragment_indices < frag_pix.shape[0])
+        )
+        safe_fragment_indices = fragment_indices.clamp(
+            0, frag_pix.shape[0] - 1,
+        )
+        selected_depth = detached_raster_depth[safe_fragment_indices]
+        raster_depth_valid = (
+            fragment_index_valid
+            & torch.isfinite(selected_depth)
+            & (selected_depth > -1.0)
+        )
+        fragment_indices = safe_fragment_indices[raster_depth_valid]
+        groups = groups[raster_depth_valid]
+        if fragment_indices.numel() == 0:
+            return empty_result()
+
+        # Atomic CSR scatter is unordered; restore compact-fragment tie order.
+        fragment_indices, compact_order = torch.sort(fragment_indices)
+        groups = groups[compact_order]
+        fragment_pixels = frag_pix.detach()[fragment_indices].to(torch.int64)
     selected_attrs = frag_attrs[fragment_indices].detach()
     triangle_ids = selected_attrs[:, 3].to(torch.int64) - 1
     sort_depth = selected_attrs[:, 2]

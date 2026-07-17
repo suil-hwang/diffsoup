@@ -65,6 +65,8 @@ def rasterize_multires_triangle_alpha(
     alpha_src: torch.Tensor,
     stochastic: bool = True,
     return_fragments: bool = False,
+    rng_seed: int | None = None,
+    rng_counter: int = 0,
 ) -> torch.Tensor | tuple[torch.Tensor, RasterizationFragments]:
     """Rasterise with per-fragment multi-resolution opacity and depth testing.
 
@@ -81,6 +83,13 @@ def rasterize_multires_triangle_alpha(
         return_fragments: Return the fragment intermediates together with the
                      raster buffer so they can be reused by
                      :func:`diffsoup.opacity_aux_loss`.
+        rng_seed:    Optional stateless 64-bit seed.  When set in stochastic
+                     mode, thresholds are generated inside the depth kernel
+                     from stable ``(batch, triangle, pixel)`` identities and
+                     do not consume PyTorch's global CUDA generator.
+        rng_counter: Stateless 64-bit counter, typically the training step.
+                     This path is deterministic for fixed fragments and keys,
+                     but is not bitwise-equivalent to ``torch.rand``.
 
     Returns:
         ``rast_out`` by default.  When ``return_fragments=True``, returns
@@ -111,12 +120,21 @@ def rasterize_multires_triangle_alpha(
         _rz._cuda_stream(pos),
     )
 
-    if stochastic:
-        alpha_thresh = torch.rand(num_frags, dtype=torch.float32, device=dev)
+    if stochastic and rng_seed is not None:
+        rast = _rz._depth_test_counter_rng(
+            (H, W), pos, frag_pix, frag_attrs, frag_alpha,
+            rng_seed, rng_counter,
+        )
     else:
-        alpha_thresh = torch.full((num_frags,), 0.5, dtype=torch.float32, device=dev)
-
-    rast = _rz._depth_test((H, W), pos, frag_pix, frag_attrs, frag_alpha, alpha_thresh)
+        if stochastic:
+            alpha_thresh = torch.rand(num_frags, dtype=torch.float32, device=dev)
+        else:
+            alpha_thresh = torch.full(
+                (num_frags,), 0.5, dtype=torch.float32, device=dev,
+            )
+        rast = _rz._depth_test(
+            (H, W), pos, frag_pix, frag_attrs, frag_alpha, alpha_thresh,
+        )
     if return_fragments:
         return rast, RasterizationFragments(frag_pix, frag_attrs, frag_alpha)
     return rast

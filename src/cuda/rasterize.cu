@@ -5,6 +5,8 @@
 #include <thrust/scan.h>
 #include <thrust/system/cuda/execution_policy.h>
 
+#include <limits>
+
 namespace diffsoup {
 namespace cuda {
 
@@ -46,7 +48,8 @@ __global__ void compute_triangle_rects_kernel(
     int V, const float* pos,      // [B * V][4]
     int T, const int* tri,        // [T][3]
     int* triangle_rects,          // [B * T][4]: h0, h_len, w0, w_len
-    int* frag_counts              // [B * T]
+    int* frag_counts,             // [B * T]
+    int* triangle_stats           // [2]: active triangles, max candidates
 ) {
     const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= B * T) return;
@@ -134,26 +137,35 @@ __global__ void compute_triangle_rects_kernel(
 
     triangle_rects[idx*4+0]=h0; triangle_rects[idx*4+1]=h_len;
     triangle_rects[idx*4+2]=w0; triangle_rects[idx*4+3]=w_len;
-    frag_counts[idx]=h_len * w_len;
+    const int candidate_count = h_len * w_len;
+    frag_counts[idx] = candidate_count;
+    atomicAdd(&triangle_stats[0], 1);
+    atomicMax(&triangle_stats[1], candidate_count);
 }
 
-int compute_triangle_rects(
+TriangleRectStats compute_triangle_rects(
     int H, int W, int B,
     int V, const float* pos,     // [B * V][4]
     int T, const int* tri,       // [T][3]
     int* triangle_rects,         // [B * T][4]: h0, h_len, w0, w_len
     int* frag_prefix_sum,        // [B * T]
+    int* triangle_stats,         // [2]: active triangles, max candidates
     cudaStream_t stream
 ) {
+    TriangleRectStats stats{0, 0, 0};
     const int total = B * T;
-    if (total == 0) return 0;
+    if (total == 0) return stats;
 
+    CUDA_CHECK(cudaMemsetAsync(
+        triangle_stats, 0, 2u * sizeof(int), stream
+    ));
     // The prefix buffer first holds counts and is then scanned in place.
     compute_triangle_rects_kernel<<<CUDA_BLOCKS(total), CUDA_THREADS, 0, stream>>>(
-        H, W, B, V, pos, T, tri, triangle_rects, frag_prefix_sum
+        H, W, B, V, pos, T, tri, triangle_rects, frag_prefix_sum,
+        triangle_stats
     );
 
-    // Use the caller's current stream for both the scan and the scalar copy.
+    // Use the caller's current stream for the scan and all scalar copies.
     thrust::inclusive_scan(
         thrust::cuda::par.on(stream),
         thrust::device_pointer_cast(frag_prefix_sum),
@@ -161,14 +173,20 @@ int compute_triangle_rects(
         thrust::device_pointer_cast(frag_prefix_sum)
     );
 
-    int num_frags = 0;
     CUDA_CHECK(cudaMemcpyAsync(
-        &num_frags, frag_prefix_sum + (total - 1), sizeof(int),
+        &stats.num_frags, frag_prefix_sum + (total - 1), sizeof(int),
+        cudaMemcpyDeviceToHost, stream
+    ));
+    int host_triangle_stats[2] = {0, 0};
+    CUDA_CHECK(cudaMemcpyAsync(
+        host_triangle_stats, triangle_stats, 2u * sizeof(int),
         cudaMemcpyDeviceToHost, stream
     ));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaGetLastError());
-    return num_frags;
+    stats.active_triangles = host_triangle_stats[0];
+    stats.max_candidates = host_triangle_stats[1];
+    return stats;
 }
 
 __forceinline__ __device__ bool intersect_triangle(
@@ -209,28 +227,101 @@ __forceinline__ __device__ bool intersect_triangle(
     return b0 >= 0.f && b1 >= 0.f && b0 + b1 <= 1.f;
 }
 
-__global__ void compute_fragments_kernel(
+__global__ void compute_fragments_by_triangle_kernel(
     int H, int W,
     int V, const float* pos,
     int T, const int* tri,
     int num_tris,                // == B * T
-    int num_frags,
-    const int* frag_prefix_sum,  // [T]
-    const int* triangle_rects,   // [T, 4]
+    const int* frag_prefix_sum,  // [B * T]
+    const int* triangle_rects,   // [B * T, 4]
     int* frag_pix,               // [num_frags, 3]
     float* frag_attrs            // [num_frags, 4]
 ) {
-    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_frags) return;
+    const int tri_idx = static_cast<int>(blockIdx.x);
+    if (tri_idx >= num_tris) return;
 
-    // Mark invalid candidates in the producer kernel, avoiding a separate
-    // torch.full() over the much larger three-column candidate buffer.
-    frag_pix[idx * 3 + 0] = -1;
+    const int batch_idx = tri_idx / T;
+    const int batch_tri = tri_idx % T;
+    const int* rect = &triangle_rects[static_cast<size_t>(tri_idx) * 4u];
+    const int h0 = rect[0];
+    const int h_len = rect[1];
+    const int w0 = rect[2];
+    const int w_len = rect[3];
+    if (w_len <= 0 || h_len <= 0) return;
 
-    // Binary search to find triangle index
-    int lo = 0, hi = num_tris;
+    const int64_t candidate_count = static_cast<int64_t>(h_len) * w_len;
+    const int64_t candidate_base = (
+        tri_idx == 0 ? 0 : static_cast<int64_t>(frag_prefix_sum[tri_idx - 1])
+    );
+    const float* batch_pos = &pos[static_cast<size_t>(batch_idx) * V * 4u];
+    const int* batch_tri_indices = &tri[static_cast<size_t>(batch_tri) * 3u];
+
+    for (
+        int64_t local_idx = static_cast<int64_t>(threadIdx.x);
+        local_idx < candidate_count;
+        local_idx += static_cast<int64_t>(blockDim.x)
+    ) {
+        const int64_t idx = candidate_base + local_idx;
+        const size_t pix_offset = static_cast<size_t>(idx) * 3u;
+        const size_t attr_offset = static_cast<size_t>(idx) * 4u;
+
+        // Mark invalid candidates in the producer kernel, avoiding a separate
+        // initialization over the much larger three-column candidate buffer.
+        frag_pix[pix_offset] = -1;
+
+        const int y = h0 + static_cast<int>(local_idx / w_len);
+        const int x = w0 + static_cast<int>(local_idx % w_len);
+        if (x < 0 || x >= W || y < 0 || y >= H) continue;
+
+        const float ndc_y = -1.f + 2.f * (static_cast<float>(y) + 0.5f) / static_cast<float>(H);
+        const float ndc_x = -1.f + 2.f * (static_cast<float>(x) + 0.5f) / static_cast<float>(W);
+
+        float b0, b1;
+        float clip_z;
+        float clip_w;
+        const bool intersect = intersect_triangle(
+            ndc_y, ndc_x, batch_pos, batch_tri_indices,
+            b0, b1, clip_z, clip_w
+        );
+        if (!intersect) continue;
+
+        const float depth = clip_z / clip_w;
+        if (!(depth >= -1.f && depth <= 1.f)) continue;
+
+        frag_pix[pix_offset + 0] = batch_idx;
+        frag_pix[pix_offset + 1] = y;
+        frag_pix[pix_offset + 2] = x;
+        frag_attrs[attr_offset + 0] = b0;
+        frag_attrs[attr_offset + 1] = b1;
+        frag_attrs[attr_offset + 2] = depth;
+        frag_attrs[attr_offset + 3] = static_cast<float>(batch_tri + 1);
+    }
+}
+
+__global__ void compute_fragments_by_candidate_kernel(
+    int H, int W,
+    int V, const float* pos,
+    int T, const int* tri,
+    int num_tris,
+    int num_frags,
+    const int* frag_prefix_sum,
+    const int* triangle_rects,
+    int* frag_pix,
+    float* frag_attrs
+) {
+    const unsigned long long idx64 = (
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x
+    );
+    if (idx64 >= static_cast<unsigned long long>(num_frags)) return;
+    const int idx = static_cast<int>(idx64);
+    const size_t pix_offset = static_cast<size_t>(idx) * 3u;
+    const size_t attr_offset = static_cast<size_t>(idx) * 4u;
+    frag_pix[pix_offset] = -1;
+
+    int lo = 0;
+    int hi = num_tris;
     while (lo < hi) {
-        int mid = (lo + hi) / 2;
+        const int mid = lo + (hi - lo) / 2;
         if (frag_prefix_sum[mid] <= idx) {
             lo = mid + 1;
         } else {
@@ -241,47 +332,36 @@ __global__ void compute_fragments_kernel(
     const int tri_idx = lo;
     const int batch_idx = tri_idx / T;
     const int batch_tri = tri_idx % T;
-
-    const int* rect = &triangle_rects[tri_idx * 4];
-    const int h0 = rect[0];
-    const int h_len = rect[1];
-    const int w0 = rect[2];
+    const int* rect = &triangle_rects[static_cast<size_t>(tri_idx) * 4u];
     const int w_len = rect[3];
-    if (w_len <= 0 || h_len <= 0) return;
-
-    const int local_idx = static_cast<int>(idx) - (tri_idx == 0 ? 0 : frag_prefix_sum[tri_idx - 1]);
-    const int y = h0 + local_idx / w_len;
-    const int x = w0 + local_idx % w_len;
-
+    const int local_idx = idx - (tri_idx == 0 ? 0 : frag_prefix_sum[tri_idx - 1]);
+    const int y = rect[0] + local_idx / w_len;
+    const int x = rect[2] + local_idx % w_len;
     if (x < 0 || x >= W || y < 0 || y >= H) return;
 
     const float ndc_y = -1.f + 2.f * (static_cast<float>(y) + 0.5f) / static_cast<float>(H);
     const float ndc_x = -1.f + 2.f * (static_cast<float>(x) + 0.5f) / static_cast<float>(W);
-
     float b0, b1;
     float clip_z;
     float clip_w;
-
     const bool intersect = intersect_triangle(
         ndc_y, ndc_x,
-        &pos[batch_idx * V * 4],
-        &tri[batch_tri * 3],
+        &pos[static_cast<size_t>(batch_idx) * V * 4u],
+        &tri[static_cast<size_t>(batch_tri) * 3u],
         b0, b1, clip_z, clip_w
     );
-
     if (!intersect) return;
 
     const float depth = clip_z / clip_w;
-
     if (!(depth >= -1.f && depth <= 1.f)) return;
 
-    frag_pix[idx * 3 + 0] = batch_idx;
-    frag_pix[idx * 3 + 1] = y;
-    frag_pix[idx * 3 + 2] = x;
-    frag_attrs[idx * 4 + 0] = b0;
-    frag_attrs[idx * 4 + 1] = b1;
-    frag_attrs[idx * 4 + 2] = depth;
-    frag_attrs[idx * 4 + 3] = static_cast<float>(batch_tri + 1);
+    frag_pix[pix_offset + 0] = batch_idx;
+    frag_pix[pix_offset + 1] = y;
+    frag_pix[pix_offset + 2] = x;
+    frag_attrs[attr_offset + 0] = b0;
+    frag_attrs[attr_offset + 1] = b1;
+    frag_attrs[attr_offset + 2] = depth;
+    frag_attrs[attr_offset + 3] = static_cast<float>(batch_tri + 1);
 }
 
 void compute_fragments(
@@ -290,6 +370,8 @@ void compute_fragments(
     int T, const int* tri,
     int num_tris,
     int num_frags,
+    int active_triangles,
+    int max_candidates,
     const int* frag_prefix_sum,
     const int* triangle_rects,
     int* frag_pix,
@@ -298,17 +380,37 @@ void compute_fragments(
 ) {
     if (num_frags == 0) return;
 
-    compute_fragments_kernel<<<CUDA_BLOCKS(num_frags), CUDA_THREADS, 0, stream>>>(
-        H, W,
-        V, pos,
-        T, tri,
-        num_tris,
-        num_frags,
-        frag_prefix_sum,
-        triangle_rects,
-        frag_pix,
-        frag_attrs
+    constexpr int kMinTriangleParallelBlocks = 256;
+    constexpr int kMaxCandidatesPerUnderfilledBlock = 4096;
+    constexpr int kLargeDominantBox = 65536;
+    constexpr int kDominantBoxFraction = 16;
+    const int parallel_triangles = active_triangles > 0 ? active_triangles : 1;
+    const bool underfilled_large_boxes = (
+        active_triangles < kMinTriangleParallelBlocks
+        && static_cast<int64_t>(num_frags)
+            > static_cast<int64_t>(parallel_triangles)
+                * kMaxCandidatesPerUnderfilledBlock
     );
+    const bool dominant_large_box = (
+        max_candidates > kLargeDominantBox
+        && static_cast<int64_t>(max_candidates) * kDominantBoxFraction
+            > static_cast<int64_t>(num_frags)
+    );
+    if (underfilled_large_boxes || dominant_large_box) {
+        compute_fragments_by_candidate_kernel<<<
+            CUDA_BLOCKS(num_frags), CUDA_THREADS, 0, stream
+        >>>(
+            H, W, V, pos, T, tri, num_tris, num_frags,
+            frag_prefix_sum, triangle_rects, frag_pix, frag_attrs
+        );
+    } else {
+        compute_fragments_by_triangle_kernel<<<
+            num_tris, CUDA_THREADS, 0, stream
+        >>>(
+            H, W, V, pos, T, tri, num_tris,
+            frag_prefix_sum, triangle_rects, frag_pix, frag_attrs
+        );
+    }
 
     CUDA_CHECK(cudaGetLastError());
 }
@@ -408,6 +510,117 @@ void depth_test(
     );
 
     CUDA_CHECK(cudaGetLastError()); // catch kernel errors
+}
+
+__device__ __forceinline__ float philox_uniform(
+    unsigned long long seed,
+    unsigned long long counter,
+    unsigned long long fragment_key
+) {
+    constexpr unsigned int M0 = 0xD2511F53u;
+    constexpr unsigned int M1 = 0xCD9E8D57u;
+    constexpr unsigned int W0 = 0x9E3779B9u;
+    constexpr unsigned int W1 = 0xBB67AE85u;
+
+    unsigned int c0 = static_cast<unsigned int>(fragment_key);
+    unsigned int c1 = static_cast<unsigned int>(fragment_key >> 32);
+    unsigned int c2 = static_cast<unsigned int>(counter);
+    unsigned int c3 = static_cast<unsigned int>(counter >> 32);
+    unsigned int k0 = static_cast<unsigned int>(seed);
+    unsigned int k1 = static_cast<unsigned int>(seed >> 32);
+
+    #pragma unroll
+    for (int round = 0; round < 10; ++round) {
+        const unsigned int lo0 = M0 * c0;
+        const unsigned int hi0 = __umulhi(M0, c0);
+        const unsigned int lo1 = M1 * c2;
+        const unsigned int hi1 = __umulhi(M1, c2);
+        const unsigned int next_c0 = hi1 ^ c1 ^ k0;
+        const unsigned int next_c1 = lo1;
+        const unsigned int next_c2 = hi0 ^ c3 ^ k1;
+        const unsigned int next_c3 = lo0;
+        c0 = next_c0;
+        c1 = next_c1;
+        c2 = next_c2;
+        c3 = next_c3;
+        k0 += W0;
+        k1 += W1;
+    }
+
+    return static_cast<float>(c0 >> 8) * 0x1.0p-24f;
+}
+
+__global__ void depth_test_counter_rng_kernel(
+    int H, int W,
+    int num_frags,
+    const int* __restrict__ frag_pix,
+    const float* __restrict__ frag_attrs,
+    const float* __restrict__ frag_alpha,
+    unsigned long long rng_seed,
+    unsigned long long rng_counter,
+    long long* frag_index
+) {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_frags) return;
+
+    const size_t pix_offset = static_cast<size_t>(idx) * 3u;
+    const size_t attr_offset = static_cast<size_t>(idx) * 4u;
+    const int batch = frag_pix[pix_offset + 0];
+    if (batch < 0) return;
+
+    const int y = frag_pix[pix_offset + 1];
+    const int x = frag_pix[pix_offset + 2];
+    const int pixel = static_cast<int>(
+        (static_cast<int64_t>(batch) * H + y) * W + x
+    );
+    const int triangle = static_cast<int>(frag_attrs[attr_offset + 3]) - 1;
+    const unsigned long long semantic_key = (
+        static_cast<unsigned long long>(static_cast<unsigned int>(triangle)) << 32
+    ) | static_cast<unsigned int>(pixel);
+
+    const float threshold = philox_uniform(
+        rng_seed, rng_counter, semantic_key
+    );
+    if (frag_alpha[idx] < threshold) return;
+
+    const float zw = frag_attrs[attr_offset + 2];
+    if (zw <= -1.f || !isfinite(zw)) return;
+
+    const long long packed = pack_depth_and_index(zw + 2.f, static_cast<int>(idx));
+    atomicMin(&frag_index[pixel], packed);
+}
+
+void depth_test_counter_rng(
+    int B, int H, int W,
+    int num_frags,
+    const int* frag_pix,
+    const float* frag_attrs,
+    const float* frag_alpha,
+    unsigned long long rng_seed,
+    unsigned long long rng_counter,
+    long long* frag_index,
+    float* rast_out,
+    cudaStream_t stream
+) {
+    const int total = B * H * W;
+    if (total == 0) return;
+    if (num_frags == 0) {
+        CUDA_CHECK(cudaMemsetAsync(
+            rast_out, 0, static_cast<size_t>(total) * 4u * sizeof(float), stream
+        ));
+        return;
+    }
+
+    fill_ll_max<<<CUDA_BLOCKS(total), CUDA_THREADS, 0, stream>>>(frag_index, total);
+    depth_test_counter_rng_kernel<<<CUDA_BLOCKS(num_frags), CUDA_THREADS, 0, stream>>>(
+        H, W, num_frags, frag_pix, frag_attrs, frag_alpha,
+        rng_seed, rng_counter, frag_index
+    );
+    gather_depth_test_kernel<<<CUDA_BLOCKS(total), CUDA_THREADS, 0, stream>>>(
+        B, H, W, frag_index, frag_attrs, rast_out
+    );
+
+    CUDA_CHECK(cudaGetLastError());
 }
 
 __global__ void filter_valid_fragments_kernel(
@@ -527,6 +740,95 @@ void compact_valid_fragments(
     );
 
     CUDA_CHECK(cudaGetLastError()); // catch kernel errors
+}
+
+__global__ void count_pixel_fragments_kernel(
+    int B, int H, int W,
+    int num_frags,
+    const int* __restrict__ frag_pix,
+    int* __restrict__ pixel_offsets
+) {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_frags) return;
+
+    const size_t pix_offset = static_cast<size_t>(idx) * 3u;
+    const int batch = frag_pix[pix_offset + 0];
+    const int y = frag_pix[pix_offset + 1];
+    const int x = frag_pix[pix_offset + 2];
+    if (batch < 0 || batch >= B || y < 0 || y >= H || x < 0 || x >= W) {
+        return;
+    }
+    const long long pixel = (
+        static_cast<long long>(batch) * H + y
+    ) * W + x;
+    atomicAdd(&pixel_offsets[pixel + 1], 1);
+}
+
+__global__ void scatter_pixel_fragments_kernel(
+    int B, int H, int W,
+    int num_frags,
+    const int* __restrict__ frag_pix,
+    int* __restrict__ pixel_cursors,
+    int* __restrict__ fragment_indices
+) {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_frags) return;
+
+    const size_t pix_offset = static_cast<size_t>(idx) * 3u;
+    const int batch = frag_pix[pix_offset + 0];
+    const int y = frag_pix[pix_offset + 1];
+    const int x = frag_pix[pix_offset + 2];
+    if (batch < 0 || batch >= B || y < 0 || y >= H || x < 0 || x >= W) {
+        return;
+    }
+    const long long pixel = (
+        static_cast<long long>(batch) * H + y
+    ) * W + x;
+    const int output = atomicAdd(&pixel_cursors[pixel], 1);
+    fragment_indices[output] = static_cast<int>(idx);
+}
+
+void build_pixel_fragment_csr(
+    int B, int H, int W,
+    int num_frags,
+    const int* frag_pix,
+    int* pixel_offsets,
+    int* pixel_cursors,
+    int* fragment_indices,
+    cudaStream_t stream
+) {
+    const int64_t total_pixels64 = static_cast<int64_t>(B) * H * W;
+    if (
+        total_pixels64 < 0
+        || total_pixels64 >= static_cast<int64_t>(std::numeric_limits<int>::max())
+    ) {
+        throw std::invalid_argument("pixel CSR exceeds int32 offset range");
+    }
+    const int total_pixels = static_cast<int>(total_pixels64);
+    CUDA_CHECK(cudaMemsetAsync(
+        pixel_offsets, 0,
+        (static_cast<size_t>(total_pixels) + 1u) * sizeof(int), stream
+    ));
+    if (num_frags == 0 || total_pixels == 0) return;
+
+    count_pixel_fragments_kernel<<<CUDA_BLOCKS(num_frags), CUDA_THREADS, 0, stream>>>(
+        B, H, W, num_frags, frag_pix, pixel_offsets
+    );
+    thrust::inclusive_scan(
+        thrust::cuda::par.on(stream),
+        thrust::device_pointer_cast(pixel_offsets),
+        thrust::device_pointer_cast(pixel_offsets + total_pixels + 1),
+        thrust::device_pointer_cast(pixel_offsets)
+    );
+    CUDA_CHECK(cudaMemcpyAsync(
+        pixel_cursors, pixel_offsets,
+        static_cast<size_t>(total_pixels) * sizeof(int),
+        cudaMemcpyDeviceToDevice, stream
+    ));
+    scatter_pixel_fragments_kernel<<<CUDA_BLOCKS(num_frags), CUDA_THREADS, 0, stream>>>(
+        B, H, W, num_frags, frag_pix, pixel_cursors, fragment_indices
+    );
+    CUDA_CHECK(cudaGetLastError());
 }
 
 // CUDA device function: tests intersection between segments (1–2) and (3–4)

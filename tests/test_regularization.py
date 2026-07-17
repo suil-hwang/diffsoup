@@ -988,3 +988,128 @@ def test_cuda_fragments_integrate_with_expected_surface_and_prior_losses():
     assert Tcw.grad is None
     assert prior_depth.grad is None
     assert prior_normal.grad is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cuda_pixel_fragment_csr_matches_full_fragment_search():
+    device = torch.device("cuda")
+    vertices_data = torch.tensor(
+        [[-1., -1., 2.], [1., -1., 2.], [0., 1., 2.],
+         [-1., -1., 4.], [1., -1., 4.], [0., 1., 4.]],
+        device=device,
+    )
+    faces = torch.tensor([[0, 1, 2], [3, 4, 5]], device=device)
+    frag_pix = torch.tensor(
+        [[0, 0, 0], [0, 0, 0]], dtype=torch.int32, device=device,
+    )
+    frag_attrs = torch.tensor(
+        [[.25, .25, .1, 1.], [.25, .25, .2, 2.]], device=device,
+    )
+    frag_alpha = torch.tensor([.25, .5], device=device)
+    K = torch.tensor(
+        [[1., 0., .5], [0., 1., .5], [0., 0., 1.]], device=device,
+    )
+    Tcw = torch.eye(4, device=device).unsqueeze(0)
+    pixels = torch.tensor([[0, 0, 0]], dtype=torch.int64, device=device)
+    csr = ds.build_pixel_fragment_csr(frag_pix, 1, (1, 1))
+    torch.testing.assert_close(
+        csr.pixel_offsets,
+        torch.tensor([0, 2], dtype=torch.int32, device=device),
+    )
+
+    common = (faces, frag_pix, frag_attrs, frag_alpha, K, Tcw, pixels, (1, 1))
+    vertices_search = vertices_data.clone().requires_grad_(True)
+    vertices_csr = vertices_data.clone().requires_grad_(True)
+    search = surface.vertex_expected_surface_samples(vertices_search, *common)
+    indexed = surface.vertex_expected_surface_samples(
+        vertices_csr, *common, pixel_fragment_csr=csr,
+    )
+    for search_field, indexed_field in zip(search, indexed):
+        torch.testing.assert_close(search_field, indexed_field)
+    search_grad = torch.autograd.grad(
+        search.expected_camera_z.sum() + search.rendered_normal_camera.sum(),
+        vertices_search,
+    )[0]
+    indexed_grad = torch.autograd.grad(
+        indexed.expected_camera_z.sum() + indexed.rendered_normal_camera.sum(),
+        vertices_csr,
+    )[0]
+    torch.testing.assert_close(search_grad, indexed_grad)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cuda_pixel_fragment_csr_handles_multibatch_invalid_and_stream_cases():
+    device = torch.device("cuda")
+    stream = torch.cuda.Stream(device=device)
+    frag_pix = torch.tensor(
+        [[0, 0, 0], [0, 0, 0], [0, 1, 2], [1, 0, 1], [1, 1, 2],
+         [-1, 0, 0], [2, 0, 0], [0, 2, 0], [0, 0, 3]],
+        dtype=torch.int32,
+        device=device,
+    )
+
+    with torch.cuda.stream(stream):
+        csr = ds.build_pixel_fragment_csr(frag_pix, 2, (2, 3))
+        empty_csr = ds.build_pixel_fragment_csr(
+            frag_pix[:0].contiguous(), 2, (2, 3),
+        )
+    stream.synchronize()
+
+    expected_offsets = torch.tensor(
+        [0, 2, 2, 2, 2, 2, 3, 3, 4, 4, 4, 4, 5],
+        dtype=torch.int32,
+        device=device,
+    )
+    torch.testing.assert_close(csr.pixel_offsets, expected_offsets)
+    assert set(csr.fragment_indices[:2].cpu().tolist()) == {0, 1}
+    assert csr.fragment_indices[2].item() == 2
+    assert csr.fragment_indices[3].item() == 3
+    assert csr.fragment_indices[4].item() == 4
+    assert torch.count_nonzero(empty_csr.pixel_offsets).item() == 0
+    assert empty_csr.fragment_indices.numel() == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cuda_counter_rng_is_reproducible_and_semantic():
+    rasterize_module = importlib.import_module("diffsoup.rasterize")
+    device = torch.device("cuda")
+    pos = torch.zeros((1, 1, 4), device=device)
+    count = 32768
+    frag_pix = torch.stack(
+        (torch.zeros(count, dtype=torch.int32, device=device),
+         torch.zeros(count, dtype=torch.int32, device=device),
+         torch.arange(count, dtype=torch.int32, device=device)),
+        dim=-1,
+    )
+    frag_attrs = torch.tensor(
+        [[.25, .25, 0., 1.]], device=device,
+    ).expand(count, -1).contiguous()
+    frag_alpha = torch.full((count,), .5, device=device)
+
+    def render(counter, order=None):
+        if order is None:
+            order = torch.arange(count, device=device)
+        return rasterize_module._depth_test_counter_rng(
+            (1, count), pos, frag_pix[order].contiguous(),
+            frag_attrs[order].contiguous(), frag_alpha[order].contiguous(),
+            rng_seed=17, rng_counter=counter,
+        )
+
+    first = render(23)
+    repeated = render(23)
+    changed = render(24)
+    reordered = render(23, torch.randperm(count, device=device))
+    first_mask = first[0, 0, :, 3] > 0
+    assert torch.equal(first, repeated)
+    assert torch.equal(first, reordered)
+    assert .48 < first_mask.float().mean().item() < .52
+    assert (first_mask != (changed[0, 0, :, 3] > 0)).float().mean() > .45
+
+    threshold = 0x6627E8 / float(1 << 24)
+    def visible(alpha):
+        return rasterize_module._depth_test_counter_rng(
+            (1, 1), pos, frag_pix[:1], frag_attrs[:1],
+            torch.tensor([alpha], device=device), rng_seed=0, rng_counter=0,
+        )[0, 0, 0, 3].item() > 0
+    assert not visible(threshold - 1e-5)
+    assert visible(threshold + 1e-5)

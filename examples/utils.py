@@ -535,6 +535,7 @@ def split_edges_from_training_views(
     alpha_acc: torch.Tensor,
     tau_ratio: float,
     num_views_cap: int,
+    generator: Optional[torch.Generator] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Adaptively split long screen-space edges observed across training views.
 
@@ -554,7 +555,9 @@ def split_edges_from_training_views(
     num_original_faces = F.shape[0]
     dev = V.device
 
-    perm = torch.randperm(num_views, device=dev, dtype=torch.long)
+    perm = torch.randperm(
+        num_views, device=dev, dtype=torch.long, generator=generator,
+    )
     perm_MVPs = MVPs[perm[: min(num_views, num_views_cap)]]
 
     V_clip = project_vertices(V, perm_MVPs)

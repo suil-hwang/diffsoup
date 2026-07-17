@@ -1,8 +1,8 @@
-# examples/02_mip360_test.py
+# examples/02_mip360_test_profile.py
 # MipNeRF-360 triangle-soup radiance field optimisation with DiffSoup.
 #
 # Usage:
-#   python examples/02_mip360_test.py --scene_root ./datasets/360_v2/kitchen
+#   python examples/02_mip360_test_profile.py --scene_root ./datasets/360_v2/kitchen
 #
 # Dependencies (beyond diffsoup):
 #   pip install open3d imageio torchvision tqdm pytorch-msssim matplotlib scipy
@@ -14,8 +14,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import random
+import time
 from typing import List, Optional
 
 import imageio.v2 as iio
@@ -92,7 +94,7 @@ def main(
     print(f"[ssim] backend={SSIM_BACKEND}")
     scene_name = os.path.basename(os.path.normpath(scene_root))
     if out_dir is None:
-        out_dir = os.path.join("./results/02_mip360", scene_name)
+        out_dir = os.path.join("./results/02_mip360_profile", scene_name)
     if (
         os.path.isdir(out_dir)
         and os.listdir(out_dir)
@@ -325,8 +327,37 @@ def main(
     last_normal_vertex_grad_norm = 0.0
     last_depth_vertex_grad_norm = 0.0
 
-    pbar = tqdm(range(1, steps + 1), desc="optimising", leave=True)
+    profile_records = []
+    profile_special_steps = {
+        step for step in (
+            1, 4_999, 5_000, 5_001,
+            normal_prior_start - 1,
+            normal_prior_start,
+            normal_prior_start + normal_prior_ramp_steps,
+            9_499, 9_500, 9_501, steps,
+        ) if 1 <= step <= steps
+    }
+    train_wall_start = time.perf_counter()
+    torch.cuda.reset_peak_memory_stats()
+    profile_path = os.path.join(out_dir, "train_profile.jsonl")
+    profile_file = open(profile_path, "w", encoding="utf-8")
+    print(f"[profile] training telemetry → {profile_path}")
+
+    pbar = tqdm(range(1, steps + 1), desc="optimising", leave=True, disable=True)
     for i_iter in pbar:
+        profile_step_start = time.perf_counter()
+        profile_cuda = (
+            i_iter <= 3
+            or i_iter % 500 in (0, 1)
+            or i_iter in profile_special_steps
+        )
+        profile_events = (
+            [torch.cuda.Event(enable_timing=True) for _ in range(6)]
+            if profile_cuda else None
+        )
+        if profile_events is not None:
+            profile_events[0].record()
+
         end = min(ptr + batch_size, N_train)
         batch_idx_cpu = perm_cpu[ptr:end]
         batch_idx = perm[ptr:end]
@@ -379,6 +410,9 @@ def main(
             color.permute(0, 3, 1, 2), batch_gt_rgb.permute(0, 3, 1, 2),
         ))
         photometric_loss = aux_loss + 0.8 * l1_loss + 0.2 * ssim_loss
+        if profile_events is not None:
+            profile_events[1].record()
+
         if not use_normal_prior or i_iter < normal_prior_start:
             normal_prior_ramp = 0.0
         elif normal_prior_ramp_steps == 0:
@@ -578,7 +612,11 @@ def main(
             )
             last_depth_vertex_grad_norm = depth_vertex_grad_norm
 
+        if profile_events is not None:
+            profile_events[2].record()
         loss.backward()
+        if profile_events is not None:
+            profile_events[3].record()
         vertex_grad_norm = (
             float(V_single.grad.detach().norm().item())
             if V_single.grad is not None else 0.0
@@ -593,6 +631,9 @@ def main(
         optimizer_soup.zero_grad(set_to_none=True)
         optimizer_vert.zero_grad(set_to_none=True)
         optimizer_shader.zero_grad(set_to_none=True)
+        if profile_events is not None:
+            profile_events[4].record()
+
         l = float(loss.detach().item())
         losses.append(l)
         photo_value = float(photometric_loss.detach().item())
@@ -770,6 +811,62 @@ def main(
             # WDDM does not page subsequent training allocations.
             torch.cuda.empty_cache()
 
+        cuda_ms = None
+        if profile_events is not None:
+            profile_events[5].record()
+            profile_events[5].synchronize()
+            cuda_ms = {
+                "forward_photo": profile_events[0].elapsed_time(profile_events[1]),
+                "geometry_prior": profile_events[1].elapsed_time(profile_events[2]),
+                "backward": profile_events[2].elapsed_time(profile_events[3]),
+                "optimizer": profile_events[3].elapsed_time(profile_events[4]),
+                "post_update_topology": profile_events[4].elapsed_time(profile_events[5]),
+                "total": profile_events[0].elapsed_time(profile_events[5]),
+            }
+        profile_record = {
+            "record_type": "step",
+            "step": i_iter,
+            "wall_ms": (time.perf_counter() - profile_step_start) * 1_000.0,
+            "faces": int(F.shape[0]),
+            "levels": [Rmin, Rmax],
+            "cuda_ms": cuda_ms,
+        }
+        if i_iter <= 3 or i_iter % 100 == 0 or i_iter in profile_special_steps:
+            memory_stats = torch.cuda.memory_stats()
+            profile_record["memory"] = {
+                "allocated_mib": torch.cuda.memory_allocated() / 2**20,
+                "reserved_mib": torch.cuda.memory_reserved() / 2**20,
+                "max_allocated_mib": torch.cuda.max_memory_allocated() / 2**20,
+                "max_reserved_mib": torch.cuda.max_memory_reserved() / 2**20,
+                "inactive_split_mib": (
+                    memory_stats.get("inactive_split_bytes.all.current", 0) / 2**20
+                ),
+                "num_alloc_retries": memory_stats.get("num_alloc_retries", 0),
+                "num_ooms": memory_stats.get("num_ooms", 0),
+            }
+        profile_records.append(profile_record)
+        if len(profile_records) >= 100:
+            for record in profile_records:
+                profile_file.write(json.dumps(record, sort_keys=True) + "\n")
+            profile_file.flush()
+            profile_records.clear()
+
+    torch.cuda.synchronize()
+    memory_stats = torch.cuda.memory_stats()
+    profile_records.append({
+        "record_type": "summary",
+        "steps": steps,
+        "train_wall_seconds": time.perf_counter() - train_wall_start,
+        "peak_allocated_mib": torch.cuda.max_memory_allocated() / 2**20,
+        "peak_reserved_mib": torch.cuda.max_memory_reserved() / 2**20,
+        "num_alloc_retries": memory_stats.get("num_alloc_retries", 0),
+        "num_ooms": memory_stats.get("num_ooms", 0),
+    })
+    for record in profile_records:
+        profile_file.write(json.dumps(record, sort_keys=True) + "\n")
+    profile_file.flush()
+    profile_file.close()
+
     torch.cuda.empty_cache()
 
     # ── Final renders ────────────────────────────────────────────────
@@ -935,7 +1032,7 @@ def main(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="DiffSoup MipNeRF-360 example")
+    parser = argparse.ArgumentParser(description="Profile DiffSoup MipNeRF-360 training")
     parser.add_argument("--scene_root", type=str, default="./datasets/360_v2/kitchen")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--steps", type=int, default=10_000)
@@ -950,7 +1047,7 @@ if __name__ == "__main__":
         "--flip_z", action=argparse.BooleanOptionalAction, default=True,
     )
     parser.add_argument("--out_dir", type=str, default=None,
-                        help="Output directory (default: ./results/02_mip360/<scene>)")
+                        help="Output directory (default: ./results/02_mip360_profile/<scene>)")
     parser.add_argument(
         "--overwrite", action="store_true",
         help="Allow writing into a nonempty output directory",

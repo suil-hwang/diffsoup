@@ -13,7 +13,8 @@
 #include <cuda_runtime.h>
 
 #define CUDA_THREADS 256
-#define CUDA_BLOCKS(num) (((num) + CUDA_THREADS - 1) / CUDA_THREADS)
+#define CUDA_BLOCKS(num) \
+    ((static_cast<unsigned long long>(num) + CUDA_THREADS - 1) / CUDA_THREADS)
 
 // CUDA error checking
 #define CUDA_CHECK(call) \
