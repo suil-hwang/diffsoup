@@ -1,9 +1,11 @@
 # python/diffsoup/multires.py
 """Multi-resolution triangle features: colour, opacity, and level accumulation."""
 
+from threading import Lock
+from typing import NamedTuple, Tuple
+
 import torch
 from torch import nn
-from typing import NamedTuple, Tuple
 
 from . import _core
 from . import rasterize as _rz
@@ -257,7 +259,7 @@ class ColorMLP(nn.Module):
             valid_output = self.mlp(valid_input)
             valid_rgb = valid_base[:, :3]
             valid_res = valid_base[:, 3:4]
-            valid_output = (1.0 - valid_res) * valid_rgb + valid_res * valid_output
+            valid_output = torch.lerp(valid_rgb, valid_output, valid_res)
             output_flat[mask_flat] = valid_output
 
             return output_flat.view(B, H, W, self.output_dim)
@@ -265,7 +267,7 @@ class ColorMLP(nn.Module):
         if extra_features is not None:
             x = torch.cat([x, extra_features], dim=-1)
         y = self.mlp(x.view(-1, self.input_dim)).view(B, H, W, self.output_dim)
-        return (1.0 - res) * rgb + res * y
+        return torch.lerp(rgb, y, res)
 
 
 # ---------------------------------------------------------------------------
@@ -339,52 +341,148 @@ def multires_triangle_color(
 #  Cross-level accumulation (differentiable)
 # ---------------------------------------------------------------------------
 
+
+class _AccumulationPlan(NamedTuple):
+    forward_indices: torch.Tensor
+    forward_weights: torch.Tensor
+    reverse_offsets: torch.Tensor
+    reverse_target_indices: torch.Tensor
+    reverse_weights: torch.Tensor
+
+
+_ACCUMULATION_PLAN_CACHE: dict[tuple[int, int, int, int], _AccumulationPlan] = {}
+_ACCUMULATION_PLAN_LOCK = Lock()
+
+
+@torch.no_grad()
+def _get_accumulation_plan(
+    min_level: int,
+    max_level: int,
+    target_level: int,
+    device: torch.device,
+) -> _AccumulationPlan:
+    device_index = (
+        torch.cuda.current_device() if device.index is None else device.index
+    )
+    key = (device_index, min_level, max_level, target_level)
+
+    with _ACCUMULATION_PLAN_LOCK:
+        cached = _ACCUMULATION_PLAN_CACHE.get(key)
+        if cached is not None:
+            return cached
+
+        source_size = sum(
+            feats_at_level(level) for level in range(min_level, max_level + 1)
+        )
+        target_size = feats_at_level(target_level)
+        num_levels = max_level - min_level + 1
+        forward_indices = torch.empty(
+            target_size, num_levels, 3, dtype=torch.int32, device=device
+        )
+        forward_weights = torch.empty(
+            target_size, num_levels, 3, dtype=torch.float32, device=device
+        )
+        _core.build_accumulation_plan(
+            min_level,
+            max_level,
+            target_level,
+            forward_indices,
+            forward_weights,
+            _rz._cuda_stream(forward_indices),
+        )
+
+        # A configuration is transposed once on first use; blocking copies make
+        # the immutable cache safe to consume from any later CUDA stream.
+        source_cpu = forward_indices.detach().cpu().reshape(-1).to(torch.int64)
+        weight_cpu = forward_weights.detach().cpu().reshape(-1)
+        target_cpu = torch.arange(target_size, dtype=torch.int32).repeat_interleave(
+            num_levels * 3
+        )
+        nonzero = weight_cpu != 0.0
+        source_cpu = source_cpu[nonzero]
+        target_cpu = target_cpu[nonzero]
+        weight_cpu = weight_cpu[nonzero]
+
+        order = torch.argsort(source_cpu, stable=True)
+        source_sorted = source_cpu[order]
+        target_sorted = target_cpu[order].contiguous()
+        weight_sorted = weight_cpu[order].contiguous()
+        counts = torch.bincount(source_sorted, minlength=source_size)
+        reverse_offsets_i64 = torch.empty(source_size + 1, dtype=torch.int64)
+        reverse_offsets_i64[0] = 0
+        reverse_offsets_i64[1:] = torch.cumsum(counts, dim=0)
+        if reverse_offsets_i64[-1].item() >= torch.iinfo(torch.int32).max:
+            raise OverflowError("Reverse accumulation plan exceeds int32 range")
+
+        plan = _AccumulationPlan(
+            forward_indices=forward_indices,
+            forward_weights=forward_weights,
+            reverse_offsets=reverse_offsets_i64.to(device=device, dtype=torch.int32),
+            reverse_target_indices=target_sorted.to(
+                device=device, dtype=torch.int32
+            ),
+            reverse_weights=weight_sorted.to(device=device, dtype=torch.float32),
+        )
+        _ACCUMULATION_PLAN_CACHE[key] = plan
+        return plan
+
+
 class _AccumulateToLevelFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, min_level, max_level, target_level, feat):
         T, _, feat_dim = feat.shape
-        dev = feat.device
+        plan = _get_accumulation_plan(
+            min_level, max_level, target_level, feat.device
+        )
 
-        S_L = feats_at_level(target_level)
-        num_levels = max_level - min_level + 1
-        plan_indices = torch.empty(
-            S_L, num_levels, 3, dtype=torch.int32, device=dev
+        target_size = feats_at_level(target_level)
+        feat_out = torch.empty(
+            T, target_size, feat_dim, dtype=torch.float32, device=feat.device
         )
-        plan_weights = torch.empty(
-            S_L, num_levels, 3, dtype=torch.float32, device=dev
-        )
-        stream = _rz._cuda_stream(feat)
-        _core.build_accumulation_plan(
-            min_level, max_level, target_level,
-            plan_indices, plan_weights, stream,
-        )
-        # The CUDA kernel assigns every output element before returning.
-        feat_out = torch.empty(T, S_L, feat_dim, dtype=torch.float32, device=dev)
         _core.accumulate_to_level_forward(
-            min_level, max_level, target_level, feat,
-            plan_indices, plan_weights, feat_out, stream,
+            min_level,
+            max_level,
+            target_level,
+            feat,
+            plan.forward_indices,
+            plan.forward_weights,
+            feat_out,
+            _rz._cuda_stream(feat),
         )
 
         ctx.min_level = min_level
         ctx.max_level = max_level
         ctx.target_level = target_level
         ctx.feat_shape = feat.shape
-        ctx.save_for_backward(plan_indices, plan_weights)
+        ctx.save_for_backward(
+            plan.reverse_offsets,
+            plan.reverse_target_indices,
+            plan.reverse_weights,
+        )
         return feat_out
 
     @staticmethod
     def backward(ctx, grad_feat_out):
-        plan_indices, plan_weights = ctx.saved_tensors
+        (
+            reverse_offsets,
+            reverse_target_indices,
+            reverse_weights,
+        ) = ctx.saved_tensors
 
         grad_feat_out = grad_feat_out.contiguous()
-        grad_feat = torch.zeros(
+        grad_feat = torch.empty(
             ctx.feat_shape, dtype=torch.float32, device=grad_feat_out.device
         )
-        stream = _rz._cuda_stream(grad_feat_out)
-        _core.accumulate_to_level_backward(
-            ctx.min_level, ctx.max_level, ctx.target_level,
-            grad_feat, grad_feat_out,
-            plan_indices, plan_weights, stream,
+        _core.accumulate_to_level_backward_gather(
+            ctx.min_level,
+            ctx.max_level,
+            ctx.target_level,
+            grad_feat,
+            grad_feat_out,
+            reverse_offsets,
+            reverse_target_indices,
+            reverse_weights,
+            _rz._cuda_stream(grad_feat_out),
         )
         return None, None, None, grad_feat
 

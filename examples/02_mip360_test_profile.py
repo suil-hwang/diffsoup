@@ -86,7 +86,14 @@ def main(
     normal_prior_start: int = 5_501,
     normal_prior_ramp_steps: int = 500,
     prior_samples_per_view: int = 16_384,
+    kernel_profile_start: Optional[int] = None,
+    kernel_profile_steps: int = 3,
 ):
+    if kernel_profile_steps < 1:
+        raise ValueError("kernel_profile_steps must be positive")
+    if kernel_profile_start is not None and not 1 <= kernel_profile_start <= steps:
+        raise ValueError("kernel_profile_start must be within the training steps")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     lambda_normal_prior = LAMBDA_NORMAL_PRIOR
     lambda_depth_prior = LAMBDA_DEPTH_PRIOR_INITIAL
@@ -260,7 +267,7 @@ def main(
             ).view(-1, H, W, feat_dim)
             view_feat = ds.encode_view_dir_sh2(rast_out, eval_MVP_inv[view_idx : view_idx + 1])
             color = color_mlp.forward(
-                feat, mask=rast_out[..., -1] > 0, extra_features=view_feat,
+                feat, mask=None, extra_features=view_feat,
             ).view(1, H, W, 3)
             pred_init.append(color.squeeze(0))
         pred_init = torch.stack(pred_init, dim=0)
@@ -277,7 +284,7 @@ def main(
     optimizer_soup = Adam([
         {"params": [feat_src], "lr": 5e-2},
         {"params": [alpha_src], "lr": 5e-2},
-    ])
+    ], fused=True)
     optimizer_vert = ds.optimize.VectorAdam(params=[V_single], lr=1e-2)
     optimizer_shader = Adam([{"params": color_mlp.parameters(), "lr": 1e-2}])
 
@@ -343,8 +350,32 @@ def main(
     profile_file = open(profile_path, "w", encoding="utf-8")
     print(f"[profile] training telemetry → {profile_path}")
 
+    kernel_profiler = None
+    kernel_profile_end = None
+    if kernel_profile_start is not None:
+        kernel_profile_end = min(
+            steps, kernel_profile_start + kernel_profile_steps - 1,
+        )
+        kernel_profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False,
+        )
+        print(
+            f"[profile] CUDA trace steps "
+            f"{kernel_profile_start}..{kernel_profile_end}"
+        )
+
     pbar = tqdm(range(1, steps + 1), desc="optimising", leave=True, disable=True)
     for i_iter in pbar:
+        if kernel_profiler is not None and i_iter == kernel_profile_start:
+            torch.cuda.synchronize()
+            kernel_profiler.start()
+
         profile_step_start = time.perf_counter()
         profile_cuda = (
             i_iter <= 3
@@ -395,20 +426,26 @@ def main(
             rast_out, level=Rmax, feat=feat_acc,
         ).view(-1, H, W, feat_dim)
         view_feat = ds.encode_view_dir_sh2(rast_out, batch_MVP_inv)
-        color = color_mlp.forward(
-            feat, mask=rast_out[..., -1] > 0, extra_features=view_feat,
-        ).view(-1, H, W, 3)
+        with torch.profiler.record_function("phase::color_mlp"):
+            color = color_mlp.forward(
+                feat,
+                mask=None,
+                extra_features=view_feat,
+            ).view(-1, H, W, 3)
 
         # Opacity auxiliary loss (zero-valued; hooks gradient into alpha_src)
-        aux_loss = ds.opacity_aux_loss(
-            color.detach(), batch_gt_rgb, rast_out, V_clip, F,
-            level=Rmax, alpha_src=alpha_acc, fragments=fragments,
-        )
-        color = ds.edge_grad(color, rast_out, V_clip, F)
+        with torch.profiler.record_function("phase::opacity_aux"):
+            aux_loss = ds.opacity_aux_loss(
+                color.detach(), batch_gt_rgb, rast_out, V_clip, F,
+                level=Rmax, alpha_src=alpha_acc, fragments=fragments,
+            )
+        with torch.profiler.record_function("phase::edge"):
+            color = ds.edge_grad(color, rast_out, V_clip, F)
         l1_loss = (batch_gt_rgb - color).abs().mean()
-        ssim_loss = 0.5 * (1 - ssim(
-            color.permute(0, 3, 1, 2), batch_gt_rgb.permute(0, 3, 1, 2),
-        ))
+        with torch.profiler.record_function("phase::ssim"):
+            ssim_loss = 0.5 * (1 - ssim(
+                color.permute(0, 3, 1, 2), batch_gt_rgb.permute(0, 3, 1, 2),
+            ))
         photometric_loss = aux_loss + 0.8 * l1_loss + 0.2 * ssim_loss
         if profile_events is not None:
             profile_events[1].record()
@@ -614,16 +651,18 @@ def main(
 
         if profile_events is not None:
             profile_events[2].record()
-        loss.backward()
+        with torch.profiler.record_function("phase::backward"):
+            loss.backward()
         if profile_events is not None:
             profile_events[3].record()
         vertex_grad_norm = (
             float(V_single.grad.detach().norm().item())
             if V_single.grad is not None else 0.0
         )
-        optimizer_soup.step()
-        optimizer_vert.step()
-        optimizer_shader.step()
+        with torch.profiler.record_function("phase::optimizer"):
+            optimizer_soup.step()
+            optimizer_vert.step()
+            optimizer_shader.step()
 
         # Gradients are not used after the update.  Releasing them here keeps
         # the large post-lift source gradients out of the next forward pass
@@ -740,7 +779,7 @@ def main(
             optimizer_soup = Adam([
                 {"params": [feat_src], "lr": old_lr_feat},
                 {"params": [alpha_src], "lr": old_lr_alpha},
-            ])
+            ], fused=True)
             optimizer_vert = ds.optimize.VectorAdam(params=[V_single], lr=old_lr_vert)
 
         # ── Resample soup ────────────────────────────────────────────
@@ -803,7 +842,7 @@ def main(
             optimizer_soup = Adam([
                 {"params": [feat_src], "lr": old_lr_feat},
                 {"params": [alpha_src], "lr": old_lr_alpha},
-            ])
+            ], fused=True)
             optimizer_vert = ds.optimize.VectorAdam(params=[V_single], lr=old_lr_vert)
 
             # Resampling briefly allocates buffers close to the VRAM limit at
@@ -851,6 +890,20 @@ def main(
             profile_file.flush()
             profile_records.clear()
 
+        if kernel_profiler is not None and i_iter == kernel_profile_end:
+            torch.cuda.synchronize()
+            kernel_profiler.stop()
+            trace_stem = f"kernel_profile_{kernel_profile_start}_{kernel_profile_end}"
+            trace_path = os.path.join(out_dir, trace_stem + ".json")
+            table_path = os.path.join(out_dir, trace_stem + "_ops.txt")
+            kernel_profiler.export_chrome_trace(trace_path)
+            with open(table_path, "w", encoding="utf-8") as table_file:
+                table_file.write(kernel_profiler.key_averages().table(
+                    sort_by="self_cuda_time_total", row_limit=200,
+                ))
+            print(f"[profile] CUDA trace → {trace_path}")
+            print(f"[profile] operator table → {table_path}")
+
     torch.cuda.synchronize()
     memory_stats = torch.cuda.memory_stats()
     profile_records.append({
@@ -886,7 +939,7 @@ def main(
             ).view(-1, H, W, feat_dim)
             view_feat = ds.encode_view_dir_sh2(rast_out, eval_MVP_inv[j : j + 1])
             color = color_mlp.forward(
-                feat, mask=rast_out[..., -1] > 0, extra_features=view_feat,
+                feat, mask=None, extra_features=view_feat,
             ).view(1, H, W, 3)
             iio.imwrite(
                 os.path.join(out_dir, f"final_pred_{j}.png"),
@@ -998,7 +1051,7 @@ def main(
             ).view(-1, H, W, feat_dim)
             view_feat = ds.encode_view_dir_sh2(rast_out, MVP_inv)
             color = color_mlp.forward(
-                feat, mask=rast_out[..., -1] > 0, extra_features=view_feat,
+                feat, mask=None, extra_features=view_feat,
             ).view(1, H, W, 3)
 
             pred_lin = color.squeeze(0).clamp(0, 1)
@@ -1059,6 +1112,14 @@ if __name__ == "__main__":
     parser.add_argument("--normal_prior_start", type=int, default=5_501)
     parser.add_argument("--normal_prior_ramp_steps", type=int, default=500)
     parser.add_argument("--prior_samples_per_view", type=int, default=16_384)
+    parser.add_argument(
+        "--kernel_profile_start", type=int, default=None,
+        help="First training step captured by torch.profiler",
+    )
+    parser.add_argument(
+        "--kernel_profile_steps", type=int, default=3,
+        help="Number of consecutive steps in the CUDA trace",
+    )
     args = parser.parse_args()
 
     main(
@@ -1075,4 +1136,6 @@ if __name__ == "__main__":
         normal_prior_start=args.normal_prior_start,
         normal_prior_ramp_steps=args.normal_prior_ramp_steps,
         prior_samples_per_view=args.prior_samples_per_view,
+        kernel_profile_start=args.kernel_profile_start,
+        kernel_profile_steps=args.kernel_profile_steps,
     )

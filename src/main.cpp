@@ -472,6 +472,50 @@ NB_MODULE(_core, m)
         );
     }, "Backward pass for accumulate_to_level.");
 
+    m.def("accumulate_to_level_backward_gather", [](
+        int min_level, int max_level, int target_level,
+        nb::ndarray<float, nb::pytorch, nb::shape<-1, -1, -1>, nb::c_contig> grad_feat_all,
+        nb::ndarray<float, nb::pytorch, nb::shape<-1, -1, -1>, nb::c_contig> grad_feat_target,
+        nb::ndarray<int32_t, nb::pytorch, nb::shape<-1>, nb::c_contig> reverse_offsets,
+        nb::ndarray<int32_t, nb::pytorch, nb::shape<-1>, nb::c_contig> reverse_target_indices,
+        nb::ndarray<float, nb::pytorch, nb::shape<-1>, nb::c_contig> reverse_weights,
+        uintptr_t stream_handle
+    ) {
+        const int T = static_cast<int>(grad_feat_all.shape(0));
+        const int feat_dim = static_cast<int>(grad_feat_all.shape(2));
+        const uint32_t S = ds::total_feats_from_levels(min_level, max_level);
+        const uint32_t S_L = ds::feats_at_level(target_level);
+
+        if (grad_feat_all.shape(1) != S || grad_feat_target.shape(1) != S_L) {
+            throw std::runtime_error("Invalid feature size.");
+        }
+        if (grad_feat_target.shape(0) != grad_feat_all.shape(0)
+            || grad_feat_target.shape(2) != grad_feat_all.shape(2)) {
+            throw std::runtime_error("Gradient shapes differ.");
+        }
+        if (reverse_offsets.shape(0) != S + 1u) {
+            throw std::runtime_error("Invalid reverse offset size.");
+        }
+        if (reverse_target_indices.shape(0) != reverse_weights.shape(0)) {
+            throw std::runtime_error("Reverse target and weight sizes differ.");
+        }
+        const int device_id = grad_feat_all.device_id();
+        if (grad_feat_target.device_id() != device_id
+            || reverse_offsets.device_id() != device_id
+            || reverse_target_indices.device_id() != device_id
+            || reverse_weights.device_id() != device_id) {
+            throw std::runtime_error("All tensors must be on the same CUDA device.");
+        }
+
+        CudaDeviceGuard device_guard(device_id);
+        ds::cuda::accumulate_to_level_backward_gather(
+            T, min_level, max_level, target_level, feat_dim,
+            grad_feat_all.data(), grad_feat_target.data(),
+            reverse_offsets.data(), reverse_target_indices.data(),
+            reverse_weights.data(), stream_from_handle(stream_handle)
+        );
+    }, "Gather-based backward pass for accumulate_to_level.");
+
     // ── Remeshing ───────────────────────────────────────────────────
 
     m.def("split_triangle_soup", [](

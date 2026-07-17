@@ -568,5 +568,92 @@ void accumulate_to_level_backward(
     CUDA_CHECK(cudaGetLastError());
 }
 
+__global__ void accumulate_to_level_backward_gather_kernel(
+    int T,
+    const uint32_t S_source,
+    const uint32_t S_gather,
+    const uint32_t S_target,
+    const uint32_t feature_dim,
+    float* __restrict__ grad_features,
+    const float* __restrict__ grad_f_target,
+    const int* __restrict__ reverse_offsets,
+    const int* __restrict__ reverse_target_indices,
+    const float* __restrict__ reverse_weights
+) {
+    const uint64_t tid = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t N = static_cast<uint64_t>(T) * S_gather * feature_dim;
+    if (tid >= N) return;
+
+    const uint32_t c = static_cast<uint32_t>(tid % feature_dim);
+    const uint64_t source_row = tid / feature_dim;
+    const uint32_t s = static_cast<uint32_t>(source_row % S_gather);
+    const uint32_t t = static_cast<uint32_t>(source_row / S_gather);
+
+    float value = 0.f;
+    const int begin = reverse_offsets[s];
+    const int end = reverse_offsets[s + 1u];
+    for (int edge = begin; edge < end; ++edge) {
+        const uint32_t k = static_cast<uint32_t>(reverse_target_indices[edge]);
+        const uint64_t src = (
+            static_cast<uint64_t>(t) * S_target + k
+        ) * feature_dim + c;
+        value += reverse_weights[edge] * grad_f_target[src];
+    }
+
+    const uint64_t dst = (
+        static_cast<uint64_t>(t) * S_source + s
+    ) * feature_dim + c;
+    grad_features[dst] = value;
+}
+
+void accumulate_to_level_backward_gather(
+    int T,
+    const uint32_t min_level,
+    const uint32_t max_level,
+    const uint32_t target_level,
+    const uint32_t feature_dim,
+    float* __restrict__ grad_features,
+    const float* __restrict__ grad_f_target,
+    const int* __restrict__ reverse_offsets,
+    const int* __restrict__ reverse_target_indices,
+    const float* __restrict__ reverse_weights,
+    cudaStream_t stream
+) {
+    if (T == 0 || feature_dim == 0) return;
+
+    const uint32_t S_source = total_feats_from_levels(min_level, max_level);
+    const uint32_t S_target = feats_at_level(target_level);
+    uint32_t S_gather = S_source;
+
+    if (target_level == max_level) {
+        const uint32_t direct_offset = S_source - S_target;
+        const size_t source_pitch = static_cast<size_t>(S_source)
+            * feature_dim * sizeof(float);
+        const size_t target_pitch = static_cast<size_t>(S_target)
+            * feature_dim * sizeof(float);
+        CUDA_CHECK(cudaMemcpy2DAsync(
+            grad_features + static_cast<size_t>(direct_offset) * feature_dim,
+            source_pitch,
+            grad_f_target,
+            target_pitch,
+            target_pitch,
+            static_cast<size_t>(T),
+            cudaMemcpyDeviceToDevice,
+            stream
+        ));
+        S_gather = direct_offset;
+    }
+
+    if (S_gather == 0) return;
+
+    const uint64_t N = static_cast<uint64_t>(T) * S_gather * feature_dim;
+    accumulate_to_level_backward_gather_kernel<<<CUDA_BLOCKS(N), CUDA_THREADS, 0, stream>>>(
+        T, S_source, S_gather, S_target, feature_dim,
+        grad_features, grad_f_target,
+        reverse_offsets, reverse_target_indices, reverse_weights
+    );
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace cuda
 } // namespace diffsoup

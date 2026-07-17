@@ -91,12 +91,26 @@ void accumulate_to_level_backward(
     int T,
     const uint32_t min_level,
     const uint32_t max_level,                // original “max” used for layout/stride
-    const uint32_t target_level,             // ≤ max_level
+    const uint32_t target_level,
     const uint32_t feature_dim,
     float* __restrict__ grad_features,       // [T, Σ_{l=min..concat} S_l, C]  (zero before call)
     const float* __restrict__ grad_f_target, // [T, feats_at_level(target_level), C]
     const int* __restrict__ plan_indices,
     const float* __restrict__ plan_weights,
+    cudaStream_t stream
+);
+
+void accumulate_to_level_backward_gather(
+    int T,
+    const uint32_t min_level,
+    const uint32_t max_level,
+    const uint32_t target_level,
+    const uint32_t feature_dim,
+    float* __restrict__ grad_features,       // [T, Σ_{l=min..max} S_l, C]  (fully overwritten)
+    const float* __restrict__ grad_f_target, // [T, feats_at_level(target_level), C]
+    const int* __restrict__ reverse_offsets, // [S_source + 1]
+    const int* __restrict__ reverse_target_indices,
+    const float* __restrict__ reverse_weights,
     cudaStream_t stream
 );
 

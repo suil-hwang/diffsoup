@@ -258,7 +258,7 @@ def main(
             ).view(-1, H, W, feat_dim)
             view_feat = ds.encode_view_dir_sh2(rast_out, eval_MVP_inv[view_idx : view_idx + 1])
             color = color_mlp.forward(
-                feat, mask=rast_out[..., -1] > 0, extra_features=view_feat,
+                feat, mask=None, extra_features=view_feat,
             ).view(1, H, W, 3)
             pred_init.append(color.squeeze(0))
         pred_init = torch.stack(pred_init, dim=0)
@@ -275,7 +275,7 @@ def main(
     optimizer_soup = Adam([
         {"params": [feat_src], "lr": 5e-2},
         {"params": [alpha_src], "lr": 5e-2},
-    ])
+    ], fused=True)
     optimizer_vert = ds.optimize.VectorAdam(params=[V_single], lr=1e-2)
     optimizer_shader = Adam([{"params": color_mlp.parameters(), "lr": 1e-2}])
 
@@ -365,7 +365,7 @@ def main(
         ).view(-1, H, W, feat_dim)
         view_feat = ds.encode_view_dir_sh2(rast_out, batch_MVP_inv)
         color = color_mlp.forward(
-            feat, mask=rast_out[..., -1] > 0, extra_features=view_feat,
+            feat, mask=None, extra_features=view_feat,
         ).view(-1, H, W, 3)
 
         # Opacity auxiliary loss (zero-valued; hooks gradient into alpha_src)
@@ -699,7 +699,7 @@ def main(
             optimizer_soup = Adam([
                 {"params": [feat_src], "lr": old_lr_feat},
                 {"params": [alpha_src], "lr": old_lr_alpha},
-            ])
+            ], fused=True)
             optimizer_vert = ds.optimize.VectorAdam(params=[V_single], lr=old_lr_vert)
 
         # ── Resample soup ────────────────────────────────────────────
@@ -762,7 +762,7 @@ def main(
             optimizer_soup = Adam([
                 {"params": [feat_src], "lr": old_lr_feat},
                 {"params": [alpha_src], "lr": old_lr_alpha},
-            ])
+            ], fused=True)
             optimizer_vert = ds.optimize.VectorAdam(params=[V_single], lr=old_lr_vert)
 
             # Resampling briefly allocates buffers close to the VRAM limit at
@@ -789,7 +789,7 @@ def main(
             ).view(-1, H, W, feat_dim)
             view_feat = ds.encode_view_dir_sh2(rast_out, eval_MVP_inv[j : j + 1])
             color = color_mlp.forward(
-                feat, mask=rast_out[..., -1] > 0, extra_features=view_feat,
+                feat, mask=None, extra_features=view_feat,
             ).view(1, H, W, 3)
             iio.imwrite(
                 os.path.join(out_dir, f"final_pred_{j}.png"),
@@ -901,7 +901,7 @@ def main(
             ).view(-1, H, W, feat_dim)
             view_feat = ds.encode_view_dir_sh2(rast_out, MVP_inv)
             color = color_mlp.forward(
-                feat, mask=rast_out[..., -1] > 0, extra_features=view_feat,
+                feat, mask=None, extra_features=view_feat,
             ).view(1, H, W, 3)
 
             pred_lin = color.squeeze(0).clamp(0, 1)
