@@ -88,9 +88,10 @@ through `04_view_results.py`, `05_benchmark_fps.py`, `06_export_web.py`,
 
 Keep downloaded data in `datasets/`, training outputs in `results/`, exported
 assets in `web/data/`, paper material in `paper/`, and documentation images in
-`pics/`. `datasets/`, `results/`, `web/data/`, `tests/`, and `paper/` are all
-ignored in this checkout. Do not infer that ignored local files are committed
-or supported solely because they exist on disk.
+`pics/`. `datasets/`, `results/`, `web/data/`, and `paper/` are ignored.
+`tests/` is ignored by default with explicit exceptions for selected regression
+files. Do not infer that an ignored or merely unignored local file is committed
+or supported solely because it exists on disk.
 
 ## Training and Geometry-Prior Contracts
 
@@ -111,6 +112,30 @@ and reinitialize opacity; do not describe opacity as preserved across the
 lift. Topology is reconsidered every 100 steps, with visibility pruning and
 screen-space edge splitting ending near step 9,500. Feature and opacity rows
 must follow the returned parent/face map whenever topology changes.
+
+Topology transitions preserve optimizer objects and transport initialized
+state only when tensors actually change. Face feature/alpha Adam row moments
+follow the composed `new_face -> old_face` map while scalar steps and parameter
+group options remain unchanged. Retained vertex `VectorAdam` `g1`/`g2` gather
+through a one-dimensional `new -> old` map; split vertices follow the ordered
+direct `(N, 3)` affine recipes. Its scalar step is preserved. A topology no-op
+leaves parameter objects and optimizer state untouched. The step-5,000 lift
+resets only the replaced feature/alpha state; it preserves the vertex optimizer,
+although a real same-step topology transition may migrate that vertex state.
+
+Moment interpolation is a warm-start transport, not an exact optimizer
+reparameterization; in particular, linearly transporting `g2` is a deliberate
+heuristic. Preserve the splitter's actual affine weights rather than assuming
+that every new vertex is a 0.5 midpoint. Current child feature/alpha parameters
+and moments copy their parent row consistently; they are not a child-local
+barycentric reparameterization of the parent's lattice field.
+
+Optimizer-state transport validates maps and recipes before mutation, then
+replaces moment buffers one key at a time. This bounds a 50K R5 C7 Adam
+transition to one extra 1,034 MiB moment instead of retaining both new moments
+at once. Do not restore copy-before-pop transactional behavior unless its
+roughly 1 GiB additional peak is justified; a CUDA failure during transport is
+fatal to the current trainer rather than a recoverable transition.
 
 `01_mip360.py` currently initializes and targets 15,000 faces regardless of
 its exposed `n_points` argument. `02_mip360_test.py` is the variant in which
@@ -237,9 +262,12 @@ is not a supported fallback.
 
 Use four-space indentation. Python uses `snake_case` for functions/variables,
 `PascalCase` for classes/dataclasses, and uppercase constants. Preserve type
-hints and concise docstrings. Keep imports grouped, avoid unrelated mechanical
-rewrites, and run `git diff --check` before handoff. There is no enforced
-formatter or linter.
+hints and concise docstrings. Put short contract docstrings on private helpers
+or data containers when ownership, caching, layout direction, or stream safety
+is not obvious; do not repeat the same explanation on standard autograd
+`forward`/`backward` methods and nearby inline comments. Keep imports grouped,
+avoid unrelated mechanical rewrites, and run `git diff --check` before handoff.
+There is no enforced formatter or linter.
 
 Validate tensor shape, dtype, device, contiguity, and empty-input behavior at
 the public Python/native boundary. CUDA raster, multires, and encoding paths
@@ -260,15 +288,34 @@ The CUDA custom-autograd boundaries are deliberate:
   projected positions in backward;
 - `opacity_aux_loss` returns an exact zero value but carries an analytic alpha
   gradient, and cached fragments must remain equivalent to recomputation;
-- `accumulate_to_level` builds an interpolation plan in forward and reuses it
-  in backward. A target level may be above the stored range for feature lift.
+- `accumulate_to_level` reuses an immutable per-device/per-level plan: forward
+  is target-major and backward gathers through the nonzero source-major CSR
+  transpose. A target level may be above the stored range for feature lift.
+
+The accumulation-plan cache is keyed by CUDA device, stored level range, and
+target level. Its first construction intentionally blocks while the CUDA
+forward plan is transposed on CPU and the immutable reverse tensors are
+published back to the device; the lock plus blocking publication makes later
+reuse safe on other CUDA streams. Do not make initialization asynchronous
+without an explicit per-entry readiness event. The native gather backward must
+fully overwrite its output, retain the direct-copy identity path when the
+target equals the highest stored level, and require neither source-gradient
+zero-fill nor atomic scatter.
 
 CPU remeshing detaches tensors, converts them to CPU NumPy float32/int32,
 executes native C++, and copies results back to the original device. It is a
-synchronous, non-differentiable topology boundary. The clip splitter currently
-considers an edge only when both endpoints lie inside the NDC cube; do not rely
-on the broader wording in its Python docstring without reconciling the native
-implementation.
+synchronous, non-differentiable topology boundary. World- and clip-space split
+APIs preserve their legacy four-tuple by default. Their opt-in provenance adds
+`int32` source indices and `float32` affine weights, each shaped `(N_new, 3)`,
+and reconstructs every output vertex directly from that call's input vertices.
+The clip splitter considers an edge only when both endpoints lie inside the NDC
+cube, matching its Python documentation.
+
+`split_edges_from_training_views` first fixes visibility for the original soup
+one selected view at a time in a `[K, T_original]` bool table, then performs
+view-ordered splits with `visible_original[i][fMap]`. Do not restore the former
+all-view fragment tensor or split before all original visibility is fixed,
+because either change increases peak memory or changes later-view semantics.
 
 Keep the shared SSIM contract unchanged: prediction first, target second, NCHW
 values in `[0, 1]`, fused `padding="valid"`, and automatic
@@ -312,10 +359,12 @@ mode before comparing screenshots or hashes across surfaces.
 ## Testing, Profiling, and Validation
 
 `tests/test_regularization.py` is the tracked expected-surface and
-geometry-regularization regression file. There is no configured coverage
-threshold. `.gitignore` explicitly unignores this tracked file while other
-`tests/` contents remain ignored, so local tests can be invisible to ordinary
-`rg --files`; inspect them with
+geometry-regularization regression file. `.gitignore` also explicitly
+unignores `tests/test_optimizer_state_migration.py`, which covers optimizer
+state transport and remesh provenance; confirm its tracked status separately
+with Git rather than equating "unignored" with "committed." There is no
+configured coverage threshold. Other `tests/` contents remain ignored, so
+local tests can be invisible to ordinary `rg --files`; inspect them with
 `Get-ChildItem tests` or `rg --no-ignore --files tests`, and use
 `git ls-files tests` to distinguish committed coverage from local-only files.
 A new test intended for review must be deliberately force-added or unignored
@@ -330,6 +379,7 @@ tracked test first, then any relevant ignored local checks that are present:
 
 ```bash
 python -m pytest -q -p no:cacheprovider tests/test_regularization.py
+python -m pytest -q -p no:cacheprovider tests/test_optimizer_state_migration.py
 # Additional ignored local checks, when present:
 python -m pytest -q -p no:cacheprovider tests/test_cuda_optimizations.py
 python -m pytest -q -p no:cacheprovider tests/test_geometry_priors.py
@@ -363,14 +413,55 @@ For performance work, establish correctness first, warm up, use CUDA events or
 explicit synchronization only around measurement, and report tensor shapes,
 batch size, peak allocated memory, and full hardware/software details. For the
 garden workload, benchmark forward plus backward at B1, B2, and B4. Windows
-WDDM slowdown can appear only after the step-5,000 level lift, so run a separate
-ignored garden B4 output through at least step 5,400 before claiming long-run
-stability. `02_mip360_test_profile.py` disables tqdm output and writes
+WDDM behavior can change after the step-5,000 level lift, so run a separate
+ignored garden B4 output through at least step 5,400 for post-lift stability.
+A joint depth/normal performance claim must also pass the end of the normal
+ramp at step 6,000; use a clean non-topology window such as 6,046--6,050 and
+avoid iterations divisible by 100 or prior-detail telemetry intervals.
+`02_mip360_test_profile.py` disables tqdm output and writes
 `train_profile.jsonl` with every-step wall time, sampled CUDA phase events, and
 allocator snapshots at schedule boundaries. Keep profiling work in that
-dedicated script so its synchronization and I/O cannot affect normal runs. Use
-Nsight Compute on a small targeted workload for
+dedicated script so its synchronization and I/O cannot affect normal runs.
+After every topology attempt, `01_mip360.py`, `02_mip360_test.py`, and its
+profiling counterpart request a cache release with a zero pressure limit, but
+`empty_cache()` runs only when current
+`reserved - allocated` is at least 1 GiB. Ordinary steps additionally require
+current reserved memory to reach 90% of physical device memory. Use current
+allocator values rather than historical peaks, and do not turn this policy into
+unconditional per-step cache flushing.
+
+For a raw CUDA trace, sum only leaf `kernel`, `gpu_memcpy`, and `gpu_memset`
+activities; wrapper/user annotations are inclusive and double-count the same
+GPU work if added again. Report GPU span, merged leaf busy time, and the
+remaining same-stream idle gap separately. CUDA-runtime CPU totals such as
+`cudaStreamSynchronize` describe host blocking and can overlap queued GPU work,
+so never add them directly to GPU span or wall time. Attribute generic GEMM
+kernels through correlation IDs or enclosing ATen/autograd operations before
+calling them MLP work. Use Nsight Compute on a small targeted workload for
 occupancy, memory traffic, launch overhead, or initialization analysis.
+
+The 2026-07-18 clean Garden R5 B4 regression reference used 15,006 faces,
+`840x1297` images, fully active depth/normal priors, and steps 6,046--6,050 on
+an RTX 4070 Ti SUPER. The profiler-free steady median was about 80.32 ms/step;
+the step-6,050 CUDA-event split was 33.13 ms photometric forward, 12.98 ms
+geometry prior, 34.50 ms backward, and 5.62 ms optimizer, with 6,111 MiB peak
+allocated memory and no allocation retries or OOMs. The raw trace placed dense
+ColorMLP forward/backward at about 22.33 ms, raster fragment/depth work at
+10.95 ms span, accumulation forward at 1.50 ms, and reverse-CSR backward at
+2.27 ms. Treat these as a drift detector for the current Windows/GPU build,
+not as portable performance promises; accumulation-plan builders and the old
+atomic-scatter backward must remain absent from steady traces.
+
+The 2026-07-18 Garden 50K-face B4 10K optimizer-state regression recorded all
+10,000 steps and 95 topology-attempt transitions with zero unintended
+optimizer-step mismatches, including two topology no-ops; the step-5,000 record
+also includes the lift. At that lift, feature/alpha state intentionally reset
+from step 5,000 to 0 while the vertex state stayed at 5,000; the final
+step-9,500 prune preserved feature/alpha step 4,500 and vertex step 9,500. The
+run had zero allocator retries/OOMs, 10,703 MiB peak allocated memory,
+16,446 MiB peak reserved memory, and test PSNR 24.556 dB / SSIM 0.7603. A
+concurrent workload contaminated part of the total wall time, so do not use its
+1,965 s end-to-end duration as a throughput baseline.
 
 Rendering changes require a real OpenGL context and a trusted representative
 checkpoint, not shader-text inspection alone. Capture before/after images or

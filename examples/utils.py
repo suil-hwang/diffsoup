@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import os
 import struct
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Literal, Optional, overload, Tuple
 
 import numpy as np
 import torch
@@ -526,6 +526,7 @@ def build_keep_map(counts: torch.Tensor, remove: int) -> torch.Tensor:
     return keep_idx
 
 
+@overload
 def split_edges_from_training_views(
     resolution: Tuple[int, int],
     MVPs: torch.Tensor,
@@ -536,17 +537,75 @@ def split_edges_from_training_views(
     tau_ratio: float,
     num_views_cap: int,
     generator: Optional[torch.Generator] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Adaptively split long screen-space edges observed across training views.
+    *,
+    return_vertex_provenance: Literal[False] = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: ...
 
-    A random subset (up to ``num_views_cap``) of training views is selected.
-    For each view, visible triangles are identified via rasterisation and
-    their edges are split in clip space until no edge exceeds ``tau_ratio``
-    image heights.
 
-    Returns:
-        V, F, face_map — updated vertices, faces, and an index tensor mapping
-        each new face back to its parent in the *original* ``F``.
+@overload
+def split_edges_from_training_views(
+    resolution: Tuple[int, int],
+    MVPs: torch.Tensor,
+    V: torch.Tensor,
+    F: torch.Tensor,
+    Rmax: int,
+    alpha_acc: torch.Tensor,
+    tau_ratio: float,
+    num_views_cap: int,
+    generator: Optional[torch.Generator] = None,
+    *,
+    return_vertex_provenance: Literal[True],
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    List[Tuple[torch.Tensor, torch.Tensor]],
+]: ...
+
+def release_cuda_cache_under_pressure(
+    reserved_limit_bytes: int,
+    min_reclaimable_bytes: int = 1 << 30,
+    *,
+    synchronize: bool = False,
+) -> bool:
+    """Release unused CUDA cache only when allocator pressure is high."""
+    if synchronize:
+        torch.cuda.current_stream().synchronize()
+    reserved = torch.cuda.memory_reserved()
+    if reserved < reserved_limit_bytes:
+        return False
+    if reserved - torch.cuda.memory_allocated() < min_reclaimable_bytes:
+        return False
+    torch.cuda.empty_cache()
+    return True
+
+def split_edges_from_training_views(
+    resolution: Tuple[int, int],
+    MVPs: torch.Tensor,
+    V: torch.Tensor,
+    F: torch.Tensor,
+    Rmax: int,
+    alpha_acc: torch.Tensor,
+    tau_ratio: float,
+    num_views_cap: int,
+    generator: Optional[torch.Generator] = None,
+    *,
+    return_vertex_provenance: bool = False,
+) -> (
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    | Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        List[Tuple[torch.Tensor, torch.Tensor]],
+    ]
+):
+    """Split long visible edges and optionally return ordered vertex recipes.
+
+    Visibility is collected one view at a time from the original soup before
+    any split, avoiding a large multi-view fragment allocation without changing
+    the subsequent view-ordered split inputs. The face map always targets the
+    input ``F``. Each recipe maps one split output directly to that call's input.
     """
     import diffsoup as ds
 
@@ -561,24 +620,45 @@ def split_edges_from_training_views(
     perm_MVPs = MVPs[perm[: min(num_views, num_views_cap)]]
 
     V_clip = project_vertices(V, perm_MVPs)
-    rast = ds.rasterize_multires_triangle_alpha(
-        (H, W), V_clip, F, Rmax, alpha_acc, stochastic=False,
+    visible_original = torch.zeros(
+        (perm_MVPs.shape[0], num_original_faces),
+        dtype=torch.bool,
+        device=dev,
     )
+    for i in range(perm_MVPs.shape[0]):
+        rast_i = ds.rasterize_multires_triangle_alpha(
+            (H, W), V_clip[i : i + 1], F, Rmax, alpha_acc,
+            stochastic=False,
+        )[0]
+        face_idx = (
+            rast_i[rast_i[..., -1] > 0][..., -1].int() - 1
+        ).unique().ravel()
+        assert torch.all(face_idx >= 0) and torch.all(
+            face_idx < num_original_faces
+        )
+        visible_original[i, face_idx] = True
+        del rast_i
+    del V_clip
 
     fMap = torch.arange(F.shape[0], device=dev, dtype=torch.long)
+    vertex_recipes = []
 
     for i in range(perm_MVPs.shape[0]):
-        rast_i = rast[i]
-        face_idx = (rast_i[rast_i[..., -1] > 0][..., -1].int() - 1).unique().ravel()
-        assert torch.all(face_idx >= 0) and torch.all(face_idx < num_original_faces)
-
-        valid_faces = torch.zeros(num_original_faces, dtype=torch.int32, device=dev)
-        valid_faces[face_idx] = 1
-        valid_faces = valid_faces[fMap].contiguous()
-
-        V, F, fMap_next, _ = ds.split_triangle_soup_clip_until(
-            (H, W), perm_MVPs[i], V, F, valid_faces, tau_ratio=tau_ratio,
+        valid_faces = visible_original[i].to(torch.int32)[fMap].contiguous()
+        outputs = ds.split_triangle_soup_clip_until(
+            (H, W), perm_MVPs[i], V, F, valid_faces,
+            tau_ratio=tau_ratio,
+            return_vertex_provenance=return_vertex_provenance,
         )
+        V_next, F_next, fMap_next = outputs[:3]
+        if F_next.shape[0] == F.shape[0]:
+            continue
+
+        if return_vertex_provenance:
+            vertex_recipes.append((outputs[4], outputs[5]))
+        V, F = V_next, F_next
         fMap = fMap[fMap_next].contiguous()
 
+    if return_vertex_provenance:
+        return V, F, fMap, vertex_recipes
     return V, F, fMap

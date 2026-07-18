@@ -41,6 +41,7 @@ from utils import (
     log_linear_schedule,
     count_visible_triangles,
     build_keep_map,
+    release_cuda_cache_under_pressure,
     split_edges_from_training_views,
 )
 
@@ -72,6 +73,15 @@ def _vertex_gradient_norm(
     return float(gradient.detach().norm().item())
 
 
+def _optimizer_parameter_step(
+    optimizer: torch.optim.Optimizer,
+    parameter: torch.Tensor,
+) -> int:
+    """Read one optimizer step counter at an explicitly profiled transition."""
+    step = optimizer.state.get(parameter, {}).get("step", 0)
+    return int(step.detach().item()) if torch.is_tensor(step) else int(step)
+
+
 def main(
     scene_root: str = "./datasets/360_v2/kitchen",
     batch_size: int = 4,
@@ -95,6 +105,10 @@ def main(
         raise ValueError("kernel_profile_start must be within the training steps")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    cuda_cache_limit_bytes = (
+        int(0.9 * torch.cuda.get_device_properties(device).total_memory)
+        if device.type == "cuda" else 0
+    )
     lambda_normal_prior = LAMBDA_NORMAL_PRIOR
     lambda_depth_prior = LAMBDA_DEPTH_PRIOR_INITIAL
     lambda_depth_prior_final = LAMBDA_DEPTH_PRIOR_FINAL
@@ -278,6 +292,7 @@ def main(
         )
     del pred_init, color, feat, view_feat, rast_out, V_clip
     print(f"[save] initial renders → {out_dir}/initial_pred_*.png")
+    torch.cuda.empty_cache()
 
     # ── Optimisers ───────────────────────────────────────────────────
 
@@ -752,49 +767,75 @@ def main(
         if prior_samples is not None:
             del prior_samples, expected_surface
 
-        # ── Lift multi-resolution levels at step 5 000 ───────────────
-        if i_iter == 5_000 and i_iter < steps:
-            old_lr_feat = optimizer_soup.param_groups[0]["lr"]
-            old_lr_alpha = optimizer_soup.param_groups[1]["lr"]
-            old_lr_vert = optimizer_vert.param_groups[0]["lr"]
-            del optimizer_soup, optimizer_vert
+        is_lift_step = i_iter == 5_000 and i_iter < steps
+        is_topology_step = i_iter % 100 == 0 and i_iter < 9_550
+        transition_record = None
+        did_prune = False
+        did_split = False
+        topology_changed = False
+        if is_lift_step or is_topology_step:
+            transition_record = {
+                "faces_before": int(F.shape[0]),
+                "vertices_before": int(V_single.shape[0]),
+                "lifted": False,
+                "did_prune": False,
+                "did_split": False,
+                "topology_changed": False,
+                "actions": [],
+                "optimizer_steps_before": {
+                    "feature": _optimizer_parameter_step(
+                        optimizer_soup, feat_src,
+                    ),
+                    "alpha": _optimizer_parameter_step(
+                        optimizer_soup, alpha_src,
+                    ),
+                    "vertices": _optimizer_parameter_step(
+                        optimizer_vert, V_single,
+                    ),
+                },
+            }
 
+        # ── Lift multi-resolution levels at step 5 000 ───────────────
+        if is_lift_step:
             with torch.no_grad():
-                feat_src_lifted = ds.accumulate_to_level(0, 0, feat_src, target_level=2)
+                old_feat_src = feat_src
+                old_alpha_src = alpha_src
+                feat_src_lifted = ds.accumulate_to_level(
+                    0, 0, old_feat_src, target_level=2,
+                )
                 Rmin, Rmax = 2, 5
-                new_feat_src = ds.build_multires_triangle_color(
+                feat_src = ds.build_multires_triangle_color(
                     F.shape[0], Rmin, Rmax, feat_dim=feat_dim,
                 ).to(device="cuda")
-                new_feat_src[..., : feat_src_lifted.shape[1], :] = feat_src_lifted
-                feat_src = new_feat_src
+                feat_src[..., : feat_src_lifted.shape[1], :] = feat_src_lifted
 
                 alpha_src = ds.build_multires_triangle_color(
                     F.shape[0], Rmin, Rmax, feat_dim=1,
                 ).to(device="cuda")
 
-            feat_src.requires_grad = True
-            alpha_src.requires_grad = True
-            del feat_src_lifted, new_feat_src
-
-            optimizer_soup = Adam([
-                {"params": [feat_src], "lr": old_lr_feat},
-                {"params": [alpha_src], "lr": old_lr_alpha},
-            ], fused=True)
-            optimizer_vert = ds.optimize.VectorAdam(params=[V_single], lr=old_lr_vert)
+            feat_src.requires_grad_(True)
+            alpha_src.requires_grad_(True)
+            ds.optimize.replace_optimizer_parameter_(
+                optimizer_soup, old_feat_src, feat_src, None,
+            )
+            ds.optimize.replace_optimizer_parameter_(
+                optimizer_soup, old_alpha_src, alpha_src, None,
+            )
+            assert transition_record is not None
+            transition_record["lifted"] = True
+            transition_record["actions"].append(
+                "lift_feature_basis_and_reset_alpha",
+            )
+            del old_feat_src, old_alpha_src, feat_src_lifted
 
         # ── Resample soup ────────────────────────────────────────────
-        if i_iter % 100 == 0 and i_iter < 9_550:
-            old_lr_feat = optimizer_soup.param_groups[0]["lr"]
-            old_lr_alpha = optimizer_soup.param_groups[1]["lr"]
-            old_lr_vert = optimizer_vert.param_groups[0]["lr"]
-            del optimizer_soup, optimizer_vert
-
+        if is_topology_step:
             with torch.no_grad():
                 source_feat = feat_src
                 source_alpha = alpha_src
                 parent_map = torch.arange(F.shape[0], device=F.device)
                 alpha_acc = None
-                topology_changed = False
+                vertex_recipes = []
 
                 if F.shape[0] > target_faces:
                     alpha_acc = ds.accumulate_to_level(
@@ -808,47 +849,103 @@ def main(
                         tri_counts, remove=F.shape[0] - target_faces,
                     )
                     F = F[keep_map]
-                    V_single, F = ds.remove_unreferenced_vertices_from_soup(V_single, F)
+                    current_vertices = V_single
+                    pruned_vertices, F, vertex_parent_map = (
+                        ds.remove_unreferenced_vertices_from_soup(
+                            current_vertices, F, return_vertex_map=True,
+                        )
+                    )
+                    if pruned_vertices.shape[0] != current_vertices.shape[0]:
+                        pruned_vertices.requires_grad_(True)
+                        ds.optimize.replace_optimizer_parameter_(
+                            optimizer_vert,
+                            current_vertices,
+                            pruned_vertices,
+                            vertex_parent_map,
+                        )
+                        V_single = pruned_vertices
                     parent_map = parent_map[keep_map]
                     alpha_acc = alpha_acc[keep_map]
                     topology_changed = True
+                    did_prune = True
+                    del tri_counts, keep_map, current_vertices
+                    del pruned_vertices, vertex_parent_map
 
                 if i_iter < 9_500:
                     if alpha_acc is None:
                         alpha_acc = ds.accumulate_to_level(
                             Rmin, Rmax, source_alpha,
                         ).sigmoid()
-                    V_single, F, face_map = split_edges_from_training_views(
-                        (H // 2, W // 2), MVPs, V_single, F,
-                        Rmax, alpha_acc,
-                        tau_ratio=1 / 5, num_views_cap=20,
-                        generator=topology_rng,
+                    split_vertices, split_faces, face_map, vertex_recipes = (
+                        split_edges_from_training_views(
+                            (H // 2, W // 2), MVPs, V_single, F,
+                            Rmax, alpha_acc,
+                            tau_ratio=1 / 5, num_views_cap=20,
+                            generator=topology_rng,
+                            return_vertex_provenance=True,
+                        )
                     )
-                    parent_map = parent_map[face_map]
-                    topology_changed = True
+                    if vertex_recipes:
+                        split_vertices.requires_grad_(True)
+                        ds.optimize.replace_vector_adam_parameter_(
+                            optimizer_vert,
+                            V_single,
+                            split_vertices,
+                            vertex_recipes,
+                        )
+                        V_single, F = split_vertices, split_faces
+                        parent_map = parent_map[face_map]
+                        topology_changed = True
+                        did_split = True
+                    del split_vertices, split_faces, face_map
 
                 if topology_changed:
-                    feat_src = ds.expand_by_index(source_feat, parent_map)
-                    alpha_src = ds.expand_by_index(source_alpha, parent_map)
-
-            del source_feat, source_alpha, parent_map, alpha_acc, topology_changed
+                    new_feat_src = ds.expand_by_index(source_feat, parent_map)
+                    new_alpha_src = ds.expand_by_index(source_alpha, parent_map)
+                    new_feat_src.requires_grad_(True)
+                    new_alpha_src.requires_grad_(True)
+                    ds.optimize.replace_optimizer_parameter_(
+                        optimizer_soup, source_feat, new_feat_src, parent_map,
+                    )
+                    ds.optimize.replace_optimizer_parameter_(
+                        optimizer_soup, source_alpha, new_alpha_src, parent_map,
+                    )
+                    feat_src, alpha_src = new_feat_src, new_alpha_src
+                    del new_feat_src, new_alpha_src
 
             print(f"  [resample] verts={V_single.shape[0]:,}  faces={F.shape[0]:,}")
 
-            V_single.requires_grad = True
-            feat_src.requires_grad = True
-            alpha_src.requires_grad = True
+            del source_feat, source_alpha, parent_map, alpha_acc
+            del vertex_recipes
 
-            optimizer_soup = Adam([
-                {"params": [feat_src], "lr": old_lr_feat},
-                {"params": [alpha_src], "lr": old_lr_alpha},
-            ], fused=True)
-            optimizer_vert = ds.optimize.VectorAdam(params=[V_single], lr=old_lr_vert)
+        cache_released = release_cuda_cache_under_pressure(
+            0 if is_topology_step else cuda_cache_limit_bytes,
+            synchronize=is_topology_step,
+        )
 
-            # Resampling briefly allocates buffers close to the VRAM limit at
-            # Rmax=5. Release those cached blocks before the next iteration so
-            # WDDM does not page subsequent training allocations.
-            torch.cuda.empty_cache()
+        if transition_record is not None:
+            transition_record["faces_after"] = int(F.shape[0])
+            transition_record["vertices_after"] = int(V_single.shape[0])
+            transition_record["did_prune"] = did_prune
+            transition_record["did_split"] = did_split
+            transition_record["topology_changed"] = topology_changed
+            if did_prune:
+                transition_record["actions"].append("prune")
+            if did_split:
+                transition_record["actions"].append("split")
+            if is_topology_step and not topology_changed:
+                transition_record["actions"].append("topology_noop")
+            transition_record["optimizer_steps_after"] = {
+                "feature": _optimizer_parameter_step(
+                    optimizer_soup, feat_src,
+                ),
+                "alpha": _optimizer_parameter_step(
+                    optimizer_soup, alpha_src,
+                ),
+                "vertices": _optimizer_parameter_step(
+                    optimizer_vert, V_single,
+                ),
+            }
 
         cuda_ms = None
         if profile_events is not None:
@@ -869,7 +966,10 @@ def main(
             "faces": int(F.shape[0]),
             "levels": [Rmin, Rmax],
             "cuda_ms": cuda_ms,
+            "cache_released": cache_released,
         }
+        if transition_record is not None:
+            profile_record["transition"] = transition_record
         if i_iter <= 3 or i_iter % 100 == 0 or i_iter in profile_special_steps:
             memory_stats = torch.cuda.memory_stats()
             profile_record["memory"] = {

@@ -27,8 +27,8 @@ int TriangleSoupSplitter::splitTriangleEdge(int t, int e) {
     float my = 0.5f * (A[1] + B[1]);
     float mz = 0.5f * (A[2] + B[2]);
 
-    int mA = addVertex(mx, my, mz);
-    int mB = addVertex(mx, my, mz);
+    int mA = addVertex(mx, my, mz, a, b, 0.5f, 0.5f);
+    int mB = addVertex(mx, my, mz, a, b, 0.5f, 0.5f);
 
     int cA = copyVertex(c);
     int cB = c;
@@ -68,11 +68,32 @@ int TriangleSoupSplitter::splitTriangleEdge(int t, int e) {
     return newTriIdx;
 }
 
-TriangleSoupSplitter::TriangleSoupSplitter(const float* verts, const int* tris, int nv, int nt)
-    : originalNumTriangles(nt)
+TriangleSoupSplitter::TriangleSoupSplitter(
+    const float* verts,
+    const int* tris,
+    int nv,
+    int nt,
+    bool track_vertex_provenance)
+    : originalNumTriangles(nt),
+      trackVertexProvenance(track_vertex_provenance)
 {
     vertices.assign(verts, verts + nv * 3);
     triangles.assign(tris, tris + nt * 3);
+
+    if (trackVertexProvenance) {
+        vertexSourceIndices.resize(
+            static_cast<size_t>(nv) * vertexProvenanceWidth);
+        vertexSourceWeights.resize(
+            static_cast<size_t>(nv) * vertexProvenanceWidth);
+        for (int i = 0; i < nv; ++i) {
+            for (int slot = 0; slot < vertexProvenanceWidth; ++slot) {
+                const size_t offset =
+                    static_cast<size_t>(i) * vertexProvenanceWidth + slot;
+                vertexSourceIndices[offset] = i;
+                vertexSourceWeights[offset] = slot == 0 ? 1.0f : 0.0f;
+            }
+        }
+    }
 
     triGen.assign(nt, 0);
     triOrigin.resize(nt);
@@ -103,6 +124,16 @@ void TriangleSoupSplitter::splitLongEdges(int numSplits, float tau) {
         triOrigin.reserve(triOrigin.size() + static_cast<size_t>(numSplits));
         faceMapping.reserve(faceMapping.size() + static_cast<size_t>(numSplits));
         sameAsOriginal.reserve(sameAsOriginal.size() + static_cast<size_t>(numSplits));
+        if (trackVertexProvenance) {
+            vertexSourceIndices.reserve(
+                vertexSourceIndices.size()
+                + static_cast<size_t>(numSplits)
+                    * 3 * vertexProvenanceWidth);
+            vertexSourceWeights.reserve(
+                vertexSourceWeights.size()
+                + static_cast<size_t>(numSplits)
+                    * 3 * vertexProvenanceWidth);
+        }
     }
     // In unbounded mode (numSplits < 0) we skip reserves to avoid huge allocations.
     // Reserves are only a perf hint; removing them entirely is also fine.
@@ -156,6 +187,105 @@ void TriangleSoupSplitter::getFaceMapping(int* outMapping) const {
 void TriangleSoupSplitter::getSameAsOriginal(int* outFlags) const {
     const int T = getNumTriangles();
     for (int t = 0; t < T; ++t) outFlags[t] = sameAsOriginal[t] ? 1 : 0;
+}
+
+void TriangleSoupSplitter::getVertexProvenance(
+    int* outIndices, float* outWeights) const
+{
+    if (!trackVertexProvenance) {
+        throw std::runtime_error("world-split vertex provenance was not tracked");
+    }
+    std::memcpy(
+        outIndices,
+        vertexSourceIndices.data(),
+        vertexSourceIndices.size() * sizeof(int));
+    std::memcpy(
+        outWeights,
+        vertexSourceWeights.data(),
+        vertexSourceWeights.size() * sizeof(float));
+}
+
+inline int TriangleSoupSplitter::addVertex(
+    float x, float y, float z,
+    int source0, int source1,
+    float weight0, float weight1)
+{
+    int idx = numVerts();
+    vertices.push_back(x);
+    vertices.push_back(y);
+    vertices.push_back(z);
+    if (trackVertexProvenance) {
+        appendBlendedVertexProvenance(source0, source1, weight0, weight1);
+    }
+    return idx;
+}
+
+inline int TriangleSoupSplitter::copyVertex(int src) {
+    const float* s = p(src);
+    return addVertex(s[0], s[1], s[2], src, src, 1.0f, 0.0f);
+}
+
+inline void TriangleSoupSplitter::appendBlendedVertexProvenance(
+    int source0, int source1,
+    float weight0, float weight1)
+{
+    int mergedIndices[vertexProvenanceWidth] = {-1, -1, -1};
+    float mergedWeights[vertexProvenanceWidth] = {0.0f, 0.0f, 0.0f};
+    const int sources[2] = {source0, source1};
+    const float outerWeights[2] = {weight0, weight1};
+
+    for (int outer = 0; outer < 2; ++outer) {
+        for (int slot = 0; slot < vertexProvenanceWidth; ++slot) {
+            const size_t offset =
+                static_cast<size_t>(sources[outer]) * vertexProvenanceWidth
+                + slot;
+            const float contribution =
+                outerWeights[outer] * vertexSourceWeights[offset];
+            if (contribution == 0.0f) continue;
+
+            const int inputSource = vertexSourceIndices[offset];
+            int destination = -1;
+            for (int existing = 0;
+                 existing < vertexProvenanceWidth;
+                 ++existing) {
+                if (mergedIndices[existing] == inputSource) {
+                    destination = existing;
+                    break;
+                }
+                if (destination < 0 && mergedIndices[existing] < 0) {
+                    destination = existing;
+                }
+            }
+            if (destination < 0) {
+                throw std::runtime_error(
+                    "world-split vertex provenance exceeds three input vertices");
+            }
+            mergedIndices[destination] = inputSource;
+            mergedWeights[destination] += contribution;
+        }
+    }
+
+    int compacted = 0;
+    for (int slot = 0; slot < vertexProvenanceWidth; ++slot) {
+        if (mergedWeights[slot] == 0.0f) continue;
+        mergedIndices[compacted] = mergedIndices[slot];
+        mergedWeights[compacted] = mergedWeights[slot];
+        ++compacted;
+    }
+    for (int slot = compacted; slot < vertexProvenanceWidth; ++slot) {
+        mergedIndices[slot] = -1;
+        mergedWeights[slot] = 0.0f;
+    }
+
+    const int fallback = mergedIndices[0];
+    if (fallback < 0) {
+        throw std::runtime_error("world-split vertex provenance is empty");
+    }
+    for (int slot = 0; slot < vertexProvenanceWidth; ++slot) {
+        if (mergedIndices[slot] < 0) mergedIndices[slot] = fallback;
+        vertexSourceIndices.push_back(mergedIndices[slot]);
+        vertexSourceWeights.push_back(mergedWeights[slot]);
+    }
 }
 
 } // namespace diffsoup

@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <numeric>
 #include <algorithm>
+#include <memory>
 
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
@@ -556,6 +557,86 @@ NB_MODULE(_core, m)
     }, nb::rv_policy::take_ownership,
        "Split a triangle soup by repeatedly bisecting the longest edges in world space.");
 
+    m.def("split_triangle_soup_with_provenance", [](
+        nb::ndarray<float, nb::numpy, nb::shape<-1, 3>, nb::c_contig> verts,
+        nb::ndarray<int,   nb::numpy, nb::shape<-1, 3>, nb::c_contig> faces,
+        int numSplits,
+        float tau
+    ) -> nb::tuple {
+        const int N = (int) verts.shape(0);
+        const int M = (int) faces.shape(0);
+
+        diffsoup::TriangleSoupSplitter splitter(
+            verts.data(), faces.data(), N, M, true);
+        splitter.splitLongEdges(numSplits, tau);
+
+        const int newN = splitter.getNumVertices();
+        const int newM = splitter.getNumTriangles();
+
+        auto verts_storage = std::make_unique<float[]>(
+            static_cast<size_t>(newN) * 3);
+        auto faces_storage = std::make_unique<int[]>(
+            static_cast<size_t>(newM) * 3);
+        auto map_storage = std::make_unique<int[]>(newM);
+        auto flag_storage = std::make_unique<int[]>(newM);
+        auto vertex_indices_storage = std::make_unique<int[]>(
+            static_cast<size_t>(newN) * 3);
+        auto vertex_weights_storage = std::make_unique<float[]>(
+            static_cast<size_t>(newN) * 3);
+
+        float *verts_ptr = verts_storage.get();
+        int   *faces_ptr = faces_storage.get();
+        int   *map_ptr   = map_storage.get();
+        int   *flag_ptr  = flag_storage.get();
+        int   *vertex_source_indices_ptr = vertex_indices_storage.get();
+        float *vertex_source_weights_ptr = vertex_weights_storage.get();
+
+        splitter.exportToFlatArrays(verts_ptr, faces_ptr);
+        splitter.getFaceMapping(map_ptr);
+        splitter.getSameAsOriginal(flag_ptr);
+        splitter.getVertexProvenance(
+            vertex_source_indices_ptr, vertex_source_weights_ptr);
+
+        nb::capsule verts_owner(verts_ptr, [](void *p) noexcept { delete[] (float*) p; });
+        verts_storage.release();
+        nb::capsule faces_owner(faces_ptr, [](void *p) noexcept { delete[] (int*) p; });
+        faces_storage.release();
+        nb::capsule map_owner(map_ptr, [](void *p) noexcept { delete[] (int*) p; });
+        map_storage.release();
+        nb::capsule flag_owner(flag_ptr, [](void *p) noexcept { delete[] (int*) p; });
+        flag_storage.release();
+        nb::capsule vertex_indices_owner(
+            vertex_source_indices_ptr,
+            [](void *p) noexcept { delete[] (int*) p; });
+        vertex_indices_storage.release();
+        nb::capsule vertex_weights_owner(
+            vertex_source_weights_ptr,
+            [](void *p) noexcept { delete[] (float*) p; });
+        vertex_weights_storage.release();
+
+        nb::ndarray<float, nb::numpy, nb::shape<-1, 3>, nb::c_contig> outVerts(
+            verts_ptr, { (size_t)newN, (size_t)3 }, verts_owner);
+        nb::ndarray<int, nb::numpy, nb::shape<-1, 3>, nb::c_contig> outFaces(
+            faces_ptr, { (size_t)newM, (size_t)3 }, faces_owner);
+        nb::ndarray<int, nb::numpy, nb::shape<-1>, nb::c_contig> faceMapping(
+            map_ptr, { (size_t)newM }, map_owner);
+        nb::ndarray<int, nb::numpy, nb::shape<-1>, nb::c_contig> faceFlags(
+            flag_ptr, { (size_t)newM }, flag_owner);
+        nb::ndarray<int, nb::numpy, nb::shape<-1, 3>, nb::c_contig> vertexSources(
+            vertex_source_indices_ptr,
+            { (size_t)newN, (size_t)3 },
+            vertex_indices_owner);
+        nb::ndarray<float, nb::numpy, nb::shape<-1, 3>, nb::c_contig> vertexWeights(
+            vertex_source_weights_ptr,
+            { (size_t)newN, (size_t)3 },
+            vertex_weights_owner);
+
+        return nb::make_tuple(
+            outVerts, outFaces, faceMapping, faceFlags,
+            vertexSources, vertexWeights);
+    }, nb::rv_policy::take_ownership,
+       "Split in world space and return direct input-vertex provenance.");
+
     m.def("split_triangle_soup_clip", [](
         nb::ndarray<float, nb::numpy, nb::shape<4, 4>,  nb::c_contig> mvp,
         nb::ndarray<float, nb::numpy, nb::shape<-1, 3>, nb::c_contig> verts,
@@ -599,4 +680,88 @@ NB_MODULE(_core, m)
     }, nb::rv_policy::take_ownership,
        "Split a triangle soup by longest edges measured in screen space (NDC); "
        "tau_ratio is in image-height units, x-axis scaled by W/H.");
+
+    m.def("split_triangle_soup_clip_with_provenance", [](
+        nb::ndarray<float, nb::numpy, nb::shape<4, 4>,  nb::c_contig> mvp,
+        nb::ndarray<float, nb::numpy, nb::shape<-1, 3>, nb::c_contig> verts,
+        nb::ndarray<int,   nb::numpy, nb::shape<-1, 3>, nb::c_contig> faces,
+        nb::ndarray<int,   nb::numpy, nb::shape<-1>,    nb::c_contig> valid_faces,
+        int numSplits, float tau_ratio, float aspectWH
+    ) -> nb::tuple {
+        const int N = (int) verts.shape(0);
+        const int M = (int) faces.shape(0);
+
+        diffsoup::TriangleSoupSplitterClip splitter(
+            mvp.data(), verts.data(), faces.data(), N, M,
+            valid_faces.data(), true
+        );
+
+        splitter.splitLongEdges(numSplits, tau_ratio, aspectWH);
+
+        const int newN = splitter.getNumVertices();
+        const int newM = splitter.getNumTriangles();
+
+        auto verts_storage = std::make_unique<float[]>(
+            static_cast<size_t>(newN) * 3);
+        auto faces_storage = std::make_unique<int[]>(
+            static_cast<size_t>(newM) * 3);
+        auto map_storage = std::make_unique<int[]>(newM);
+        auto flag_storage = std::make_unique<int[]>(newM);
+        auto vertex_indices_storage = std::make_unique<int[]>(
+            static_cast<size_t>(newN) * 3);
+        auto vertex_weights_storage = std::make_unique<float[]>(
+            static_cast<size_t>(newN) * 3);
+
+        float *verts_ptr = verts_storage.get();
+        int   *faces_ptr = faces_storage.get();
+        int   *map_ptr   = map_storage.get();
+        int   *flag_ptr  = flag_storage.get();
+        int   *vertex_source_indices_ptr = vertex_indices_storage.get();
+        float *vertex_source_weights_ptr = vertex_weights_storage.get();
+
+        splitter.exportToFlatArrays(verts_ptr, faces_ptr);
+        splitter.getFaceMapping(map_ptr);
+        splitter.getSameAsOriginal(flag_ptr);
+        splitter.getVertexProvenance(
+            vertex_source_indices_ptr, vertex_source_weights_ptr);
+
+        nb::capsule verts_owner(verts_ptr, [](void *p) noexcept { delete[] (float*) p; });
+        verts_storage.release();
+        nb::capsule faces_owner(faces_ptr, [](void *p) noexcept { delete[] (int*) p; });
+        faces_storage.release();
+        nb::capsule map_owner(map_ptr, [](void *p) noexcept { delete[] (int*) p; });
+        map_storage.release();
+        nb::capsule flag_owner(flag_ptr, [](void *p) noexcept { delete[] (int*) p; });
+        flag_storage.release();
+        nb::capsule vertex_indices_owner(
+            vertex_source_indices_ptr,
+            [](void *p) noexcept { delete[] (int*) p; });
+        vertex_indices_storage.release();
+        nb::capsule vertex_weights_owner(
+            vertex_source_weights_ptr,
+            [](void *p) noexcept { delete[] (float*) p; });
+        vertex_weights_storage.release();
+
+        nb::ndarray<float, nb::numpy, nb::shape<-1, 3>, nb::c_contig> outVerts(
+            verts_ptr, { (size_t)newN, (size_t)3 }, verts_owner);
+        nb::ndarray<int, nb::numpy, nb::shape<-1, 3>, nb::c_contig> outFaces(
+            faces_ptr, { (size_t)newM, (size_t)3 }, faces_owner);
+        nb::ndarray<int, nb::numpy, nb::shape<-1>, nb::c_contig> faceMapping(
+            map_ptr, { (size_t)newM }, map_owner);
+        nb::ndarray<int, nb::numpy, nb::shape<-1>, nb::c_contig> faceFlags(
+            flag_ptr, { (size_t)newM }, flag_owner);
+        nb::ndarray<int, nb::numpy, nb::shape<-1, 3>, nb::c_contig> vertexSources(
+            vertex_source_indices_ptr,
+            { (size_t)newN, (size_t)3 },
+            vertex_indices_owner);
+        nb::ndarray<float, nb::numpy, nb::shape<-1, 3>, nb::c_contig> vertexWeights(
+            vertex_source_weights_ptr,
+            { (size_t)newN, (size_t)3 },
+            vertex_weights_owner);
+
+        return nb::make_tuple(
+            outVerts, outFaces, faceMapping, faceFlags,
+            vertexSources, vertexWeights);
+    }, nb::rv_policy::take_ownership,
+       "Split in screen space and return input-vertex interpolation recipes.");
 }

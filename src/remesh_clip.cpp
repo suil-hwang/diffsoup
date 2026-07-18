@@ -131,8 +131,8 @@ int TriangleSoupSplitterClip::splitTriangleEdge(int t, int e) {
     Cworld[1] = tA * Aworld[1] + tB * Bworld[1];
     Cworld[2] = tA * Aworld[2] + tB * Bworld[2];
 
-    int mA = addVertex(Cworld[0], Cworld[1], Cworld[2]);
-    int mB = addVertex(Cworld[0], Cworld[1], Cworld[2]);
+    int mA = addVertex(Cworld[0], Cworld[1], Cworld[2], a, b, tA, tB);
+    int mB = addVertex(Cworld[0], Cworld[1], Cworld[2], a, b, tA, tB);
 
     int cA = copyVertex(c);
     int cB = c;
@@ -171,8 +171,10 @@ TriangleSoupSplitterClip::TriangleSoupSplitterClip(
     const float* verts,
     const int* tris,
     int nv, int nt,
-    const int* valid_tris)
-    : originalNumTriangles(nt)
+    const int* valid_tris,
+    bool track_vertex_provenance)
+    : originalNumTriangles(nt),
+      trackVertexProvenance(track_vertex_provenance)
 {
     // Flat xyz coordinates: 3 floats per vertex.
     vertices.assign(verts, verts + nv * 3);
@@ -180,6 +182,21 @@ TriangleSoupSplitterClip::TriangleSoupSplitterClip(
     valid_triangles.assign(valid_tris, valid_tris + nt);
 
     for (int i = 0; i < 16; ++i) mvp4x4[i] = mvp[i];
+
+    if (trackVertexProvenance) {
+        vertexSourceIndices.resize(
+            static_cast<size_t>(nv) * vertexProvenanceWidth);
+        vertexSourceWeights.resize(
+            static_cast<size_t>(nv) * vertexProvenanceWidth);
+        for (int i = 0; i < nv; ++i) {
+            for (int slot = 0; slot < vertexProvenanceWidth; ++slot) {
+                const size_t offset =
+                    static_cast<size_t>(i) * vertexProvenanceWidth + slot;
+                vertexSourceIndices[offset] = i;
+                vertexSourceWeights[offset] = slot == 0 ? 1.0f : 0.0f;
+            }
+        }
+    }
 
     triGen.assign(nt, 0);
     triOrigin.resize(nt);
@@ -209,6 +226,16 @@ void TriangleSoupSplitterClip::splitLongEdges(int numSplits, float tau_ratio, fl
         triOrigin.reserve(triOrigin.size() + static_cast<size_t>(numSplits));
         faceMapping.reserve(faceMapping.size() + static_cast<size_t>(numSplits));
         sameAsOriginal.reserve(sameAsOriginal.size() + static_cast<size_t>(numSplits));
+        if (trackVertexProvenance) {
+            vertexSourceIndices.reserve(
+                vertexSourceIndices.size()
+                + static_cast<size_t>(numSplits)
+                    * 3 * vertexProvenanceWidth);
+            vertexSourceWeights.reserve(
+                vertexSourceWeights.size()
+                + static_cast<size_t>(numSplits)
+                    * 3 * vertexProvenanceWidth);
+        }
     }
 
     std::priority_queue<EdgeRef> pq;
@@ -258,6 +285,22 @@ void TriangleSoupSplitterClip::getSameAsOriginal(int* outFlags) const {
     for (int t = 0; t < T; ++t) outFlags[t] = sameAsOriginal[t] ? 1 : 0;
 }
 
+void TriangleSoupSplitterClip::getVertexProvenance(
+    int* outIndices, float* outWeights) const
+{
+    if (!trackVertexProvenance) {
+        throw std::runtime_error("clip-split vertex provenance was not tracked");
+    }
+    std::memcpy(
+        outIndices,
+        vertexSourceIndices.data(),
+        vertexSourceIndices.size() * sizeof(int));
+    std::memcpy(
+        outWeights,
+        vertexSourceWeights.data(),
+        vertexSourceWeights.size() * sizeof(float));
+}
+
 // ---- small inline helpers ----
 inline void TriangleSoupSplitterClip::triIndices(int t, int& i0, int& i1, int& i2) const {
     const int b = 3 * t;
@@ -267,14 +310,83 @@ inline void TriangleSoupSplitterClip::setTri(int t, int i0, int i1, int i2) {
     const int b = 3 * t;
     triangles[b + 0] = i0; triangles[b + 1] = i1; triangles[b + 2] = i2;
 }
-inline int TriangleSoupSplitterClip::addVertex(float x, float y, float z) {
+inline int TriangleSoupSplitterClip::addVertex(
+    float x, float y, float z,
+    int source0, int source1,
+    float weight0, float weight1)
+{
     int idx = getNumVertices();
     vertices.push_back(x); vertices.push_back(y); vertices.push_back(z);
+    if (trackVertexProvenance) {
+        appendBlendedVertexProvenance(source0, source1, weight0, weight1);
+    }
     return idx;
 }
 inline int TriangleSoupSplitterClip::copyVertex(int src) {
     const float* s = p(src);
-    return addVertex(s[0], s[1], s[2]);
+    return addVertex(s[0], s[1], s[2], src, src, 1.0f, 0.0f);
+}
+inline void TriangleSoupSplitterClip::appendBlendedVertexProvenance(
+    int source0, int source1,
+    float weight0, float weight1)
+{
+    int mergedIndices[vertexProvenanceWidth] = {-1, -1, -1};
+    float mergedWeights[vertexProvenanceWidth] = {0.0f, 0.0f, 0.0f};
+    const int sources[2] = {source0, source1};
+    const float outerWeights[2] = {weight0, weight1};
+
+    for (int outer = 0; outer < 2; ++outer) {
+        for (int slot = 0; slot < vertexProvenanceWidth; ++slot) {
+            const size_t offset =
+                static_cast<size_t>(sources[outer]) * vertexProvenanceWidth
+                + slot;
+            const float contribution =
+                outerWeights[outer] * vertexSourceWeights[offset];
+            if (contribution == 0.0f) continue;
+
+            const int inputSource = vertexSourceIndices[offset];
+            int destination = -1;
+            for (int existing = 0;
+                 existing < vertexProvenanceWidth;
+                 ++existing) {
+                if (mergedIndices[existing] == inputSource) {
+                    destination = existing;
+                    break;
+                }
+                if (destination < 0 && mergedIndices[existing] < 0) {
+                    destination = existing;
+                }
+            }
+            if (destination < 0) {
+                throw std::runtime_error(
+                    "clip-split vertex provenance exceeds three input vertices");
+            }
+            mergedIndices[destination] = inputSource;
+            mergedWeights[destination] += contribution;
+        }
+    }
+
+    int compacted = 0;
+    for (int slot = 0; slot < vertexProvenanceWidth; ++slot) {
+        if (mergedWeights[slot] == 0.0f) continue;
+        mergedIndices[compacted] = mergedIndices[slot];
+        mergedWeights[compacted] = mergedWeights[slot];
+        ++compacted;
+    }
+    for (int slot = compacted; slot < vertexProvenanceWidth; ++slot) {
+        mergedIndices[slot] = -1;
+        mergedWeights[slot] = 0.0f;
+    }
+
+    const int fallback = mergedIndices[0];
+    if (fallback < 0) {
+        throw std::runtime_error("clip-split vertex provenance is empty");
+    }
+    for (int slot = 0; slot < vertexProvenanceWidth; ++slot) {
+        if (mergedIndices[slot] < 0) mergedIndices[slot] = fallback;
+        vertexSourceIndices.push_back(mergedIndices[slot]);
+        vertexSourceWeights.push_back(mergedWeights[slot]);
+    }
 }
 
 } // namespace diffsoup

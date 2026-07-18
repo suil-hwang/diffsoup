@@ -373,13 +373,13 @@ def main():
         ))
         loss = aux_loss + 0.8 * l1_loss + 0.2 * ssim_loss
 
-        optimizer_soup.zero_grad(set_to_none=True)
-        optimizer_vert.zero_grad(set_to_none=True)
-        optimizer_shader.zero_grad(set_to_none=True)
         loss.backward()
         optimizer_soup.step()
         optimizer_vert.step()
         optimizer_shader.step()
+        optimizer_soup.zero_grad(set_to_none=True)
+        optimizer_vert.zero_grad(set_to_none=True)
+        optimizer_shader.zero_grad(set_to_none=True)
 
         l = float(loss.detach().item())
         losses.append(l)
@@ -387,72 +387,108 @@ def main():
 
         # ── Lift multi-resolution levels at step 5 000 ───────────────
         if i_iter == 5_000 and i_iter < steps:
+            old_feat_src = feat_src
+            old_alpha_src = alpha_src
             with torch.no_grad():
                 Rmin, Rmax = 2, 5
-                feat_src_lifted = ds.accumulate_to_level(0, 0, feat_src, target_level=Rmin)
-                new_feat_src = ds.build_multires_triangle_color(
+                feat_src_lifted = ds.accumulate_to_level(
+                    0, 0, old_feat_src, target_level=Rmin,
+                )
+                feat_src = ds.build_multires_triangle_color(
                     faces.shape[0], Rmin, Rmax, feat_dim=feat_dim,
                 ).to(device="cuda")
-                new_feat_src[..., : feat_src_lifted.shape[1], :] = feat_src_lifted
-                feat_src = new_feat_src
-
+                feat_src[..., : feat_src_lifted.shape[1], :] = feat_src_lifted
                 alpha_src = ds.build_multires_triangle_color(
                     faces.shape[0], Rmin, Rmax, feat_dim=1,
                 ).to(device="cuda")
 
-            feat_src.requires_grad = True
-            alpha_src.requires_grad = True
-
-            old_lr_feat = optimizer_soup.param_groups[0]["lr"]
-            old_lr_alpha = optimizer_soup.param_groups[1]["lr"]
-            old_lr_vert = optimizer_vert.param_groups[0]["lr"]
-
-            optimizer_soup = Adam([
-                {"params": [feat_src], "lr": old_lr_feat},
-                {"params": [alpha_src], "lr": old_lr_alpha},
-            ])
-            optimizer_vert = ds.optimize.VectorAdam(params=[verts], lr=old_lr_vert)
+            feat_src.requires_grad_(True)
+            alpha_src.requires_grad_(True)
+            ds.optimize.replace_optimizer_parameter_(
+                optimizer_soup, old_feat_src, feat_src, None,
+            )
+            ds.optimize.replace_optimizer_parameter_(
+                optimizer_soup, old_alpha_src, alpha_src, None,
+            )
+            del old_feat_src, old_alpha_src, feat_src_lifted
 
         # ── Resample soup ────────────────────────────────────────────
         if i_iter % 100 == 0 and i_iter < 9_550:
+            face_rows_changed = False
             with torch.no_grad():
-                alpha_acc = ds.accumulate_to_level(Rmin, Rmax, alpha_src).sigmoid()
+                source_feat = feat_src
+                source_alpha = alpha_src
+                parent_map = torch.arange(faces.shape[0], device=faces.device)
+                alpha_acc = ds.accumulate_to_level(
+                    Rmin, Rmax, source_alpha,
+                ).sigmoid()
                 tri_counts = count_visible_triangles(
                     (H // 2, W // 2), mvps, verts, faces,
                     level=Rmax, alpha_src=alpha_acc, batch_size=1,
                 )
 
-                # Remove invisible triangles (count < 1)
+                # Remove invisible triangles (count < 1).
                 keep_map = build_keep_map(tri_counts, thresh=1)
-                faces = faces[keep_map]
-                verts, faces = ds.remove_unreferenced_vertices_from_soup(verts, faces)
-                feat_src = ds.expand_by_index(feat_src, keep_map)
-                alpha_src = ds.expand_by_index(alpha_src, keep_map)
+                if keep_map.shape[0] != faces.shape[0]:
+                    kept_faces = faces[keep_map]
+                    pruned_vertices, pruned_faces, vertex_parent_map = (
+                        ds.remove_unreferenced_vertices_from_soup(
+                            verts, kept_faces, return_vertex_map=True,
+                        )
+                    )
+                    if pruned_vertices.shape[0] != verts.shape[0]:
+                        pruned_vertices.requires_grad_(True)
+                        ds.optimize.replace_optimizer_parameter_(
+                            optimizer_vert,
+                            verts,
+                            pruned_vertices,
+                            vertex_parent_map,
+                        )
+                        verts = pruned_vertices
+                    faces = pruned_faces
+                    parent_map = parent_map[keep_map]
+                    face_rows_changed = True
+                    del kept_faces, pruned_vertices, pruned_faces
+                    del vertex_parent_map
 
-                # Split to maintain target primitive count
+                # Split to maintain target primitive count.
                 if faces.shape[0] < TARGET_PRIMS:
                     num_splits = TARGET_PRIMS - faces.shape[0]
-                    verts, faces, face_map, _ = ds.split_triangle_soup(
-                        verts, faces, num_splits=num_splits,
+                    outputs = ds.split_triangle_soup(
+                        verts,
+                        faces,
+                        num_splits=num_splits,
+                        return_vertex_provenance=True,
                     )
-                    feat_src = ds.expand_by_index(feat_src, face_map)
-                    alpha_src = ds.expand_by_index(alpha_src, face_map)
+                    split_vertices, split_faces, face_map = outputs[:3]
+                    if split_faces.shape[0] != faces.shape[0]:
+                        split_vertices.requires_grad_(True)
+                        ds.optimize.replace_vector_adam_parameter_(
+                            optimizer_vert,
+                            verts,
+                            split_vertices,
+                            [(outputs[4], outputs[5])],
+                        )
+                        verts, faces = split_vertices, split_faces
+                        parent_map = parent_map[face_map]
+                        face_rows_changed = True
+                    del outputs, split_vertices, split_faces, face_map
+
+                if face_rows_changed:
+                    feat_src = ds.expand_by_index(source_feat, parent_map)
+                    alpha_src = ds.expand_by_index(source_alpha, parent_map)
+                    feat_src.requires_grad_(True)
+                    alpha_src.requires_grad_(True)
+                    ds.optimize.replace_optimizer_parameter_(
+                        optimizer_soup, source_feat, feat_src, parent_map,
+                    )
+                    ds.optimize.replace_optimizer_parameter_(
+                        optimizer_soup, source_alpha, alpha_src, parent_map,
+                    )
 
             print(f"  [resample] verts={verts.shape[0]:,}  faces={faces.shape[0]:,}")
-
-            verts.requires_grad = True
-            feat_src.requires_grad = True
-            alpha_src.requires_grad = True
-
-            old_lr_feat = optimizer_soup.param_groups[0]["lr"]
-            old_lr_alpha = optimizer_soup.param_groups[1]["lr"]
-            old_lr_vert = optimizer_vert.param_groups[0]["lr"]
-
-            optimizer_soup = Adam([
-                {"params": [feat_src], "lr": old_lr_feat},
-                {"params": [alpha_src], "lr": old_lr_alpha},
-            ])
-            optimizer_vert = ds.optimize.VectorAdam(params=[verts], lr=old_lr_vert)
+            del source_feat, source_alpha, parent_map, alpha_acc
+            del tri_counts, keep_map, face_rows_changed
 
     # ── Loss curve ───────────────────────────────────────────────────
 

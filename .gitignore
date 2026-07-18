@@ -220,6 +220,7 @@ tests/
 /tests/**
 !/tests/
 !/tests/test_regularization.py
+!/tests/test_optimizer_state_migration.py
 
 paper/
 tmp/

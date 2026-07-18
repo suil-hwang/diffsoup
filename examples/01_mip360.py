@@ -38,6 +38,7 @@ from utils import (
     exp_decay_mult,
     count_visible_triangles,
     build_keep_map,
+    release_cuda_cache_under_pressure,
     split_edges_from_training_views,
 )
 
@@ -62,6 +63,10 @@ def main(
     out_dir: Optional[str] = None,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    cuda_cache_limit_bytes = (
+        int(0.9 * torch.cuda.get_device_properties(device).total_memory)
+        if device.type == "cuda" else 0
+    )
     print(f"[ssim] backend={SSIM_BACKEND}")
     scene_name = os.path.basename(os.path.normpath(scene_root))
     if out_dir is None:
@@ -174,6 +179,7 @@ def main(
         )
     del pred_init, color, feat, view_feat, rast_out, V_clip
     print(f"[save] initial renders → {out_dir}/initial_pred_*.png")
+    torch.cuda.empty_cache()
 
     # ── Optimisers ───────────────────────────────────────────────────
 
@@ -270,47 +276,40 @@ def main(
 
         # ── Lift multi-resolution levels at step 5 000 ───────────────
         if i_iter == 5_000 and i_iter < steps:
-            old_lr_feat = optimizer_soup.param_groups[0]["lr"]
-            old_lr_alpha = optimizer_soup.param_groups[1]["lr"]
-            old_lr_vert = optimizer_vert.param_groups[0]["lr"]
-            del optimizer_soup, optimizer_vert
-
             with torch.no_grad():
-                feat_src_lifted = ds.accumulate_to_level(0, 0, feat_src, target_level=2)
+                old_feat_src = feat_src
+                old_alpha_src = alpha_src
+                feat_src_lifted = ds.accumulate_to_level(
+                    0, 0, old_feat_src, target_level=2,
+                )
                 Rmin, Rmax = 2, 5
-                new_feat_src = ds.build_multires_triangle_color(
+                feat_src = ds.build_multires_triangle_color(
                     F.shape[0], Rmin, Rmax, feat_dim=feat_dim,
                 ).to(device="cuda")
-                new_feat_src[..., : feat_src_lifted.shape[1], :] = feat_src_lifted
-                feat_src = new_feat_src
-
+                feat_src[..., : feat_src_lifted.shape[1], :] = feat_src_lifted
                 alpha_src = ds.build_multires_triangle_color(
                     F.shape[0], Rmin, Rmax, feat_dim=1,
                 ).to(device="cuda")
 
-            feat_src.requires_grad = True
-            alpha_src.requires_grad = True
-            del feat_src_lifted, new_feat_src
-
-            optimizer_soup = Adam([
-                {"params": [feat_src], "lr": old_lr_feat},
-                {"params": [alpha_src], "lr": old_lr_alpha},
-            ])
-            optimizer_vert = ds.optimize.VectorAdam(params=[V_single], lr=old_lr_vert)
+            feat_src.requires_grad_(True)
+            alpha_src.requires_grad_(True)
+            ds.optimize.replace_optimizer_parameter_(
+                optimizer_soup, old_feat_src, feat_src, None,
+            )
+            ds.optimize.replace_optimizer_parameter_(
+                optimizer_soup, old_alpha_src, alpha_src, None,
+            )
+            del old_feat_src, old_alpha_src, feat_src_lifted
 
         # ── Resample soup ────────────────────────────────────────────
         if i_iter % 100 == 0 and i_iter < 9_550:
-            old_lr_feat = optimizer_soup.param_groups[0]["lr"]
-            old_lr_alpha = optimizer_soup.param_groups[1]["lr"]
-            old_lr_vert = optimizer_vert.param_groups[0]["lr"]
-            del optimizer_soup, optimizer_vert
-
+            topology_changed = False
             with torch.no_grad():
                 source_feat = feat_src
                 source_alpha = alpha_src
                 parent_map = torch.arange(F.shape[0], device=F.device)
                 alpha_acc = None
-                topology_changed = False
+                vertex_recipes = []
 
                 if F.shape[0] > 15_000:
                     alpha_acc = ds.accumulate_to_level(
@@ -320,48 +319,81 @@ def main(
                         (H // 2, W // 2), MVPs, V_single, F,
                         level=Rmax, alpha_src=alpha_acc, batch_size=1,
                     )
-                    keep_map = build_keep_map(tri_counts, remove=F.shape[0] - 15_000)
+                    keep_map = build_keep_map(
+                        tri_counts, remove=F.shape[0] - 15_000,
+                    )
                     F = F[keep_map]
-                    V_single, F = ds.remove_unreferenced_vertices_from_soup(V_single, F)
+                    current_vertices = V_single
+                    pruned_vertices, F, vertex_parent_map = (
+                        ds.remove_unreferenced_vertices_from_soup(
+                            current_vertices, F, return_vertex_map=True,
+                        )
+                    )
+                    if pruned_vertices.shape[0] != current_vertices.shape[0]:
+                        pruned_vertices.requires_grad_(True)
+                        ds.optimize.replace_optimizer_parameter_(
+                            optimizer_vert,
+                            current_vertices,
+                            pruned_vertices,
+                            vertex_parent_map,
+                        )
+                        V_single = pruned_vertices
                     parent_map = parent_map[keep_map]
                     alpha_acc = alpha_acc[keep_map]
                     topology_changed = True
+                    del tri_counts, keep_map, current_vertices
+                    del pruned_vertices, vertex_parent_map
 
                 if i_iter < 9_500:
                     if alpha_acc is None:
                         alpha_acc = ds.accumulate_to_level(
                             Rmin, Rmax, source_alpha,
                         ).sigmoid()
-                    V_single, F, face_map = split_edges_from_training_views(
-                        (H // 2, W // 2), MVPs, V_single, F,
-                        Rmax, alpha_acc,
-                        tau_ratio=1 / 5, num_views_cap=20,
+                    split_vertices, split_faces, face_map, vertex_recipes = (
+                        split_edges_from_training_views(
+                            (H // 2, W // 2), MVPs, V_single, F,
+                            Rmax, alpha_acc,
+                            tau_ratio=1 / 5, num_views_cap=20,
+                            return_vertex_provenance=True,
+                        )
                     )
-                    parent_map = parent_map[face_map]
-                    topology_changed = True
+                    if vertex_recipes:
+                        split_vertices.requires_grad_(True)
+                        ds.optimize.replace_vector_adam_parameter_(
+                            optimizer_vert,
+                            V_single,
+                            split_vertices,
+                            vertex_recipes,
+                        )
+                        V_single, F = split_vertices, split_faces
+                        parent_map = parent_map[face_map]
+                        topology_changed = True
+                    del split_vertices, split_faces, face_map
 
                 if topology_changed:
-                    feat_src = ds.expand_by_index(source_feat, parent_map)
-                    alpha_src = ds.expand_by_index(source_alpha, parent_map)
-
-            del source_feat, source_alpha, parent_map, alpha_acc, topology_changed
+                    new_feat_src = ds.expand_by_index(source_feat, parent_map)
+                    new_alpha_src = ds.expand_by_index(source_alpha, parent_map)
+                    new_feat_src.requires_grad_(True)
+                    new_alpha_src.requires_grad_(True)
+                    ds.optimize.replace_optimizer_parameter_(
+                        optimizer_soup, source_feat, new_feat_src, parent_map,
+                    )
+                    ds.optimize.replace_optimizer_parameter_(
+                        optimizer_soup, source_alpha, new_alpha_src, parent_map,
+                    )
+                    feat_src, alpha_src = new_feat_src, new_alpha_src
+                    del new_feat_src, new_alpha_src
 
             print(f"  [resample] verts={V_single.shape[0]:,}  faces={F.shape[0]:,}")
 
-            V_single.requires_grad = True
-            feat_src.requires_grad = True
-            alpha_src.requires_grad = True
+            del source_feat, source_alpha, parent_map, alpha_acc
+            del vertex_recipes, topology_changed
 
-            optimizer_soup = Adam([
-                {"params": [feat_src], "lr": old_lr_feat},
-                {"params": [alpha_src], "lr": old_lr_alpha},
-            ])
-            optimizer_vert = ds.optimize.VectorAdam(params=[V_single], lr=old_lr_vert)
-
-            # Resampling briefly allocates buffers close to the VRAM limit at
-            # Rmax=5. Release those cached blocks before the next iteration so
-            # WDDM does not page subsequent training allocations.
-            torch.cuda.empty_cache()
+        release_cuda_cache_under_pressure(
+            0 if i_iter % 100 == 0 and i_iter < 9_550
+            else cuda_cache_limit_bytes,
+            synchronize=i_iter % 100 == 0 and i_iter < 9_550,
+        )
 
     torch.cuda.empty_cache()
 

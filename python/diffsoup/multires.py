@@ -343,6 +343,12 @@ def multires_triangle_color(
 
 
 class _AccumulationPlan(NamedTuple):
+    """Immutable interpolation plans for one CUDA level configuration.
+
+    ``forward_*`` are target-major, while ``reverse_*`` encode the nonzero
+    transpose as source-major CSR for the gather backward pass.
+    """
+
     forward_indices: torch.Tensor
     forward_weights: torch.Tensor
     reverse_offsets: torch.Tensor
@@ -361,6 +367,11 @@ def _get_accumulation_plan(
     target_level: int,
     device: torch.device,
 ) -> _AccumulationPlan:
+    """Return a cached forward plan and its nonzero source-major transpose.
+
+    A cache miss synchronously builds, transposes, and publishes the immutable
+    device tensors so later calls may reuse them from any CUDA stream.
+    """
     device_index = (
         torch.cuda.current_device() if device.index is None else device.index
     )
@@ -391,8 +402,7 @@ def _get_accumulation_plan(
             _rz._cuda_stream(forward_indices),
         )
 
-        # A configuration is transposed once on first use; blocking copies make
-        # the immutable cache safe to consume from any later CUDA stream.
+        # Transpose only nonzero forward edges into a source-major CSR.
         source_cpu = forward_indices.detach().cpu().reshape(-1).to(torch.int64)
         weight_cpu = forward_weights.detach().cpu().reshape(-1)
         target_cpu = torch.arange(target_size, dtype=torch.int32).repeat_interleave(
@@ -428,6 +438,8 @@ def _get_accumulation_plan(
 
 
 class _AccumulateToLevelFn(torch.autograd.Function):
+    """Apply cached target-major forward and source-major gather plans."""
+
     @staticmethod
     def forward(ctx, min_level, max_level, target_level, feat):
         T, _, feat_dim = feat.shape

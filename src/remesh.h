@@ -7,14 +7,22 @@
 #include <queue>
 #include <cmath>
 #include <cstring>
+#include <stdexcept>
 
 namespace diffsoup {
 
 class TriangleSoupSplitter {
 private:
+    static constexpr int vertexProvenanceWidth = 3;
+
     std::vector<float> vertices;   // flat xyz
     std::vector<int>   triangles;  // flat i0,i1,i2
     int originalNumTriangles;
+    bool trackVertexProvenance;
+
+    // Direct affine recipe over input vertices, three entries per output.
+    std::vector<int>   vertexSourceIndices;
+    std::vector<float> vertexSourceWeights;
 
     // current-face → original-face id it descends from
     std::vector<int> faceMapping;
@@ -62,24 +70,25 @@ private:
         triangles[base + 2] = i2;
     }
 
-    inline int addVertex(float x, float y, float z) {
-        int idx = numVerts();
-        vertices.push_back(x);
-        vertices.push_back(y);
-        vertices.push_back(z);
-        return idx;
-    }
-
-    inline int copyVertex(int src) {
-        const float* s = p(src);
-        return addVertex(s[0], s[1], s[2]);
-    }
+    inline int addVertex(
+        float x, float y, float z,
+        int source0, int source1,
+        float weight0, float weight1);
+    inline int copyVertex(int src);
+    inline void appendBlendedVertexProvenance(
+        int source0, int source1,
+        float weight0, float weight1);
 
     void enqueueTriangleEdges(int t, std::priority_queue<EdgeRef>& pq) const;
     int splitTriangleEdge(int t, int e);
 
 public:
-    TriangleSoupSplitter(const float* verts, const int* tris, int nv, int nt);
+    TriangleSoupSplitter(
+        const float* verts,
+        const int* tris,
+        int nv,
+        int nt,
+        bool track_vertex_provenance = false);
 
     void splitLongEdges(int numSplits) { splitLongEdges(numSplits, 0.0f); }
     void splitLongEdges(int numSplits, float tau);
@@ -92,6 +101,7 @@ public:
     void exportToFlatArrays(float* outVerts, int* outFaces) const;
     void getFaceMapping(int* outMapping) const;
     void getSameAsOriginal(int* outFlags) const;
+    void getVertexProvenance(int* outIndices, float* outWeights) const;
 };
 
 } // namespace diffsoup

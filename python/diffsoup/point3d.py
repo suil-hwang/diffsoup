@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from typing import Literal, overload
+
 import numpy as np
 from scipy.spatial import cKDTree
 import torch
@@ -112,19 +114,43 @@ def triangle_soup_from_points(xyz: torch.Tensor, scale: float):
     return V, F
 
 
+@overload
 def remove_unreferenced_vertices_from_soup(
     verts: torch.Tensor,
     faces: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Remove vertices that are not referenced by any face.
+    *,
+    return_vertex_map: Literal[False] = False,
+) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+
+@overload
+def remove_unreferenced_vertices_from_soup(
+    verts: torch.Tensor,
+    faces: torch.Tensor,
+    *,
+    return_vertex_map: Literal[True],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]: ...
+
+def remove_unreferenced_vertices_from_soup(
+    verts: torch.Tensor,
+    faces: torch.Tensor,
+    *,
+    return_vertex_map: bool = False,
+) -> (
+    tuple[torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+):
+    """Remove unreferenced vertices and optionally return their old indices.
 
     Args:
         verts: ``(Nv, 3)`` float tensor of vertex positions.
         faces: ``(Nf, 3)`` integer tensor of vertex indices.
+        return_vertex_map: Also return ``kept_vertices``, where
+            ``new_verts == verts[kept_vertices]``.
 
     Returns:
-        new_verts: ``(Nv', 3)`` float tensor of kept vertices.
-        new_faces: ``(Nf, 3)``  int32 tensor with remapped indices.
+        ``(new_verts, new_faces)`` or
+        ``(new_verts, new_faces, kept_vertices)`` when requested.
     """
     verts = verts.contiguous()
     faces = faces.contiguous()
@@ -137,7 +163,11 @@ def remove_unreferenced_vertices_from_soup(
     map_old2new = torch.full(
         (verts.shape[0],), -1, dtype=torch.long, device=faces.device
     )
-    map_old2new[used] = torch.arange(used.numel(), device=faces.device, dtype=torch.long)
-
+    map_old2new[used] = torch.arange(
+        used.numel(), device=faces.device, dtype=torch.long,
+    )
     new_faces = map_old2new[faces].int()
+
+    if return_vertex_map:
+        return new_verts, new_faces, used.contiguous()
     return new_verts, new_faces

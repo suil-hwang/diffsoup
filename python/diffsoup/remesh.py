@@ -11,7 +11,19 @@ def split_triangle_soup(
     faces: torch.Tensor,   # (M, 3), int32
     num_splits: int,
     tau: float = 0.0,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    *,
+    return_vertex_provenance: bool = False,
+) -> (
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    | tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]
+):
     """Split a triangle soup by repeatedly bisecting the longest edge.
 
     Args:
@@ -21,14 +33,15 @@ def split_triangle_soup(
                     with ``tau > 0`` for threshold-only mode.
         tau:        Stop once the longest remaining edge ≤ ``tau``
                     (0 disables the threshold).
+        return_vertex_provenance: Also return input source vertex indices and
+            interpolation weights for every output vertex.
 
     Returns:
-        out_verts:    ``(N', 3)`` float32 vertex positions.
-        out_faces:    ``(M', 3)`` int32 triangle indices.
-        face_mapping: ``(M',)`` int32 — maps each output face to its input
-                      face index.
-        face_flags:   ``(M',)`` int32 — 1 if the face is an exact copy of the
-                      original, 0 otherwise.
+        The legacy result is ``(out_verts, out_faces, face_mapping,
+        face_flags)``. If provenance is requested, appends
+        ``vertex_source_indices`` and ``vertex_source_weights``, both shaped
+        ``(N', 3)``. Each output vertex is their weighted sum over the input
+        vertices; original inputs use ``(i, i, i)`` and ``(1, 0, 0)``.
     """
     assert verts.ndim == 2 and verts.shape[1] == 3, "verts must be (N, 3)"
     assert faces.ndim == 2 and faces.shape[1] == 3, "faces must be (M, 3)"
@@ -36,16 +49,24 @@ def split_triangle_soup(
     dev = verts.device
     v_np = verts.float().detach().cpu().contiguous().numpy()
     f_np = faces.to(torch.int32).detach().cpu().contiguous().numpy()
-
-    out_v, out_f, out_map, out_flag = _core.split_triangle_soup(
-        v_np, f_np, int(num_splits), float(tau)
+    core_split = (
+        _core.split_triangle_soup_with_provenance
+        if return_vertex_provenance
+        else _core.split_triangle_soup
     )
+    outputs = core_split(v_np, f_np, int(num_splits), float(tau))
 
-    return (
-        torch.from_numpy(out_v).to(device=dev, dtype=torch.float32),
-        torch.from_numpy(out_f).to(device=dev, dtype=torch.int32),
-        torch.from_numpy(out_map).to(device=dev, dtype=torch.int32),
-        torch.from_numpy(out_flag).to(device=dev, dtype=torch.int32),
+    result = (
+        torch.from_numpy(outputs[0]).to(device=dev, dtype=torch.float32),
+        torch.from_numpy(outputs[1]).to(device=dev, dtype=torch.int32),
+        torch.from_numpy(outputs[2]).to(device=dev, dtype=torch.int32),
+        torch.from_numpy(outputs[3]).to(device=dev, dtype=torch.int32),
+    )
+    if not return_vertex_provenance:
+        return result
+    return result + (
+        torch.from_numpy(outputs[4]).to(device=dev, dtype=torch.int32),
+        torch.from_numpy(outputs[5]).to(device=dev, dtype=torch.float32),
     )
 
 
@@ -54,7 +75,19 @@ def split_triangle_soup_until(
     faces: torch.Tensor,
     tau: float,
     hard_cap: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    *,
+    return_vertex_provenance: bool = False,
+) -> (
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    | tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]
+):
     """Split until all edges ≤ ``tau``.
 
     Args:
@@ -62,12 +95,20 @@ def split_triangle_soup_until(
         faces:    ``(M, 3)`` int32 triangle indices.
         tau:      Maximum allowed edge length.
         hard_cap: Optional upper bound on the number of bisections.
+        return_vertex_provenance: Also return input source vertex indices and
+            interpolation weights.
 
     Returns:
-        Same four-tuple as :func:`split_triangle_soup`.
+        Same optional four- or six-tuple as :func:`split_triangle_soup`.
     """
     ns = -1 if hard_cap is None else int(hard_cap)
-    return split_triangle_soup(verts, faces, ns, tau=float(tau))
+    return split_triangle_soup(
+        verts,
+        faces,
+        ns,
+        tau=float(tau),
+        return_vertex_provenance=return_vertex_provenance,
+    )
 
 
 def split_triangle_soup_clip(
@@ -78,7 +119,19 @@ def split_triangle_soup_clip(
     valid_faces: torch.Tensor,   # (M,)
     num_splits: int,
     tau_ratio: float = 0.0,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    *,
+    return_vertex_provenance: bool = False,
+) -> (
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    | tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]
+):
     """Split a triangle soup based on image-space (clip-space) edge lengths.
 
     Pipeline:  world ``(N, 3)`` → clip ``(N, 4)`` via MVP → split in
@@ -88,8 +141,7 @@ def split_triangle_soup_clip(
     ``(x/w, y/w)`` with the x axis scaled by ``W/H`` so that the metric
     unit equals one image height.
 
-    Edges whose **both** endpoints lie outside the NDC cube ``[-1, 1]³``
-    are skipped.
+    Edges with either endpoint outside the NDC cube ``[-1, 1]³`` are skipped.
 
     Args:
         resolution:  ``(H, W)`` image resolution.
@@ -99,9 +151,15 @@ def split_triangle_soup_clip(
         valid_faces: ``(M,)`` int32 mask (1 = consider for splitting).
         num_splits:  Maximum bisections (``-1`` for threshold-only).
         tau_ratio:   Threshold in image-height units (0 disables).
+        return_vertex_provenance: Also return input source vertex indices and
+            interpolation weights for every output vertex.
 
     Returns:
-        Same four-tuple as :func:`split_triangle_soup`.
+        Same four-tuple as :func:`split_triangle_soup`.  If provenance is
+        requested, appends ``vertex_source_indices`` and
+        ``vertex_source_weights``, both shaped ``(N', 3)``. Each output vertex
+        is the weighted sum of these original input vertices. Original input
+        vertices have identity rows ``(i, i, i)`` with weights ``(1, 0, 0)``.
     """
     H, W = resolution
     assert mvp.shape == (4, 4)
@@ -117,7 +175,12 @@ def split_triangle_soup_clip(
     mvp = mvp.float().contiguous()
 
     aspect_wh = float(W) / float(H)
-    out_v, out_f, out_map, out_flag = _core.split_triangle_soup_clip(
+    core_split = (
+        _core.split_triangle_soup_clip_with_provenance
+        if return_vertex_provenance
+        else _core.split_triangle_soup_clip
+    )
+    outputs = core_split(
         mvp.detach().cpu().numpy(),
         verts.detach().cpu().numpy(),
         faces.detach().cpu().numpy(),
@@ -127,11 +190,17 @@ def split_triangle_soup_clip(
         aspect_wh,
     )
 
-    return (
-        torch.from_numpy(out_v).to(device=dev, dtype=torch.float32),
-        torch.from_numpy(out_f).to(device=dev, dtype=torch.int32),
-        torch.from_numpy(out_map).to(device=dev, dtype=torch.int32),
-        torch.from_numpy(out_flag).to(device=dev, dtype=torch.int32),
+    result = (
+        torch.from_numpy(outputs[0]).to(device=dev, dtype=torch.float32),
+        torch.from_numpy(outputs[1]).to(device=dev, dtype=torch.int32),
+        torch.from_numpy(outputs[2]).to(device=dev, dtype=torch.int32),
+        torch.from_numpy(outputs[3]).to(device=dev, dtype=torch.int32),
+    )
+    if not return_vertex_provenance:
+        return result
+    return result + (
+        torch.from_numpy(outputs[4]).to(device=dev, dtype=torch.int32),
+        torch.from_numpy(outputs[5]).to(device=dev, dtype=torch.float32),
     )
 
 
@@ -143,7 +212,19 @@ def split_triangle_soup_clip_until(
     valid_faces: torch.Tensor,
     tau_ratio: float,
     hard_cap: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    *,
+    return_vertex_provenance: bool = False,
+) -> (
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    | tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]
+):
     """Split until all image-space edges ≤ ``tau_ratio``.
 
     Args:
@@ -154,13 +235,17 @@ def split_triangle_soup_clip_until(
         valid_faces: ``(M,)`` int32 mask.
         tau_ratio:   Threshold in image-height units.
         hard_cap:    Optional upper bound on the number of bisections.
+        return_vertex_provenance: Also return input source vertex indices and
+            interpolation weights.
 
     Returns:
-        Same four-tuple as :func:`split_triangle_soup`.
+        Same optional four- or six-tuple as
+        :func:`split_triangle_soup_clip`.
     """
     ns = -1 if hard_cap is None else int(hard_cap)
     return split_triangle_soup_clip(
-        resolution, mvp, verts, faces, valid_faces, ns, tau_ratio
+        resolution, mvp, verts, faces, valid_faces, ns, tau_ratio,
+        return_vertex_provenance=return_vertex_provenance,
     )
 
 
