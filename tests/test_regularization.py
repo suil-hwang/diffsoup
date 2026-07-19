@@ -101,6 +101,149 @@ def test_expected_surface_face_forward_normal_is_winding_invariant():
     )
 
 
+@pytest.mark.parametrize(
+    "invalid_input",
+    [
+        "vertices_shape",
+        "faces_dtype",
+        "frag_attrs_shape",
+        "alpha_dtype",
+        "Tcw_shape",
+        "pixels_dtype",
+    ],
+)
+def test_expected_surface_validates_public_shapes_and_dtypes(
+    invalid_input: str,
+):
+    dtype = torch.float64
+    arguments = [
+        torch.tensor(
+            [[-1.0, -1.0, 2.0], [1.0, -1.0, 2.0], [0.0, 1.0, 2.0]],
+            dtype=dtype,
+        ),
+        torch.tensor([[0, 1, 2]], dtype=torch.int64),
+        torch.tensor([[0, 0, 0]], dtype=torch.int32),
+        torch.tensor([[0.25, 0.25, 0.0, 1.0]], dtype=dtype),
+        torch.tensor([0.5], dtype=dtype),
+        torch.tensor(
+            [[1.0, 0.0, 0.5], [0.0, 1.0, 0.5], [0.0, 0.0, 1.0]],
+            dtype=dtype,
+        ),
+        torch.eye(4, dtype=dtype).unsqueeze(0),
+        torch.tensor([[0, 0, 0]], dtype=torch.int64),
+        (1, 1),
+    ]
+    if invalid_input == "vertices_shape":
+        arguments[0] = arguments[0][:, :2]
+    elif invalid_input == "faces_dtype":
+        arguments[1] = arguments[1].to(dtype)
+    elif invalid_input == "frag_attrs_shape":
+        arguments[3] = arguments[3][:, :3]
+    elif invalid_input == "alpha_dtype":
+        arguments[4] = arguments[4].to(torch.float32)
+    elif invalid_input == "Tcw_shape":
+        arguments[6] = arguments[6].squeeze(0)
+    elif invalid_input == "pixels_dtype":
+        arguments[7] = arguments[7].to(dtype)
+    else:
+        raise AssertionError(f"Unhandled invalid input: {invalid_input}")
+
+    with pytest.raises(AssertionError):
+        surface.vertex_expected_surface_samples(*arguments)
+
+
+def test_expected_surface_uses_per_batch_intrinsics_and_transforms():
+    dtype = torch.float64
+    vertices = torch.tensor(
+        [[-2.0, -2.0, 2.0], [2.0, -2.0, 4.0], [0.0, 2.0, 3.0]],
+        dtype=dtype,
+        requires_grad=True,
+    )
+    faces = torch.tensor([[0, 1, 2]], dtype=torch.int64)
+    frag_pix = torch.tensor([[0, 0, 0], [1, 0, 0]], dtype=torch.int32)
+    frag_attrs = torch.tensor(
+        [[0.25, 0.25, 0.0, 1.0], [0.25, 0.25, 0.0, 1.0]],
+        dtype=dtype,
+    )
+    frag_alpha = torch.ones(2, dtype=dtype)
+    K = torch.tensor(
+        [
+            [[1.0, 0.0, 0.5], [0.0, 1.0, 0.5], [0.0, 0.0, 1.0]],
+            [[1.0, 0.0, -0.5], [0.0, 1.0, 0.5], [0.0, 0.0, 1.0]],
+        ],
+        dtype=dtype,
+    )
+    Tcw = torch.eye(4, dtype=dtype).repeat(2, 1, 1)
+    Tcw[1, 2, 3] = -1.0
+    pixels = torch.tensor([[0, 0, 0], [1, 0, 0]], dtype=torch.int64)
+
+    expected_surface = surface.vertex_expected_surface_samples(
+        vertices, faces, frag_pix, frag_attrs, frag_alpha,
+        K, Tcw, pixels, (1, 1),
+    )
+
+    assert expected_surface.valid.all()
+    torch.testing.assert_close(
+        expected_surface.expected_camera_z,
+        torch.tensor([3.0, 4.0], dtype=dtype),
+    )
+    expected_normal = torch.tensor(
+        [[1.0, 0.0, -2.0], [1.0, 0.0, -2.0]], dtype=dtype,
+    ) / torch.sqrt(torch.tensor(5.0, dtype=dtype))
+    torch.testing.assert_close(
+        expected_surface.rendered_normal_camera, expected_normal,
+    )
+
+
+@pytest.mark.parametrize(
+    "vertices_data",
+    [
+        [[-1.0, -1.0, 2.0], [0.0, 0.0, 2.0], [1.0, 1.0, 2.0]],
+        [[-1.0, -1.0, -2.0], [1.0, -1.0, -2.0], [0.0, 1.0, -2.0]],
+        [[1.0, -1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 0.0, 3.0]],
+    ],
+    ids=["degenerate", "behind_camera", "ray_parallel"],
+)
+def test_expected_surface_rejects_unusable_live_geometry(vertices_data):
+    dtype = torch.float64
+    vertices = torch.tensor(
+        vertices_data, dtype=dtype, requires_grad=True,
+    )
+    faces = torch.tensor([[0, 1, 2]], dtype=torch.int64)
+    frag_pix = torch.tensor([[0, 0, 0]], dtype=torch.int32)
+    frag_attrs = torch.tensor([[0.25, 0.25, 0.0, 1.0]], dtype=dtype)
+    frag_alpha = torch.ones(1, dtype=dtype)
+    K = torch.tensor(
+        [[1.0, 0.0, 0.5], [0.0, 1.0, 0.5], [0.0, 0.0, 1.0]],
+        dtype=dtype,
+    )
+    Tcw = torch.eye(4, dtype=dtype).unsqueeze(0)
+    pixels = torch.tensor([[0, 0, 0]], dtype=torch.int64)
+
+    expected_surface = surface.vertex_expected_surface_samples(
+        vertices, faces, frag_pix, frag_attrs, frag_alpha,
+        K, Tcw, pixels, (1, 1),
+    )
+
+    assert not expected_surface.valid.item()
+    torch.testing.assert_close(
+        expected_surface.expected_camera_z, torch.zeros(1, dtype=dtype),
+    )
+    torch.testing.assert_close(
+        expected_surface.rendered_normal_camera,
+        torch.zeros(1, 3, dtype=dtype),
+    )
+    torch.testing.assert_close(
+        expected_surface.accumulated_opacity, torch.ones(1, dtype=dtype),
+    )
+    (
+        expected_surface.expected_camera_z.sum()
+        + expected_surface.rendered_normal_camera.sum()
+    ).backward()
+    assert vertices.grad is not None
+    torch.testing.assert_close(vertices.grad, torch.zeros_like(vertices))
+
+
 def test_expected_surface_matches_closed_form_alpha_compositing():
     dtype = torch.float64
     vertices = torch.tensor(
@@ -182,6 +325,49 @@ def test_expected_surface_matches_closed_form_alpha_compositing():
     assert Tcw.grad is None
     assert normal_prior.grad is None
     assert depth_prior.grad is None
+
+
+def test_zero_alpha_surface_is_invalid_and_gradient_connected():
+    dtype = torch.float64
+    vertices = torch.tensor(
+        [[-1.0, -1.0, 2.0], [1.0, -1.0, 2.0], [0.0, 1.0, 2.0]],
+        dtype=dtype,
+        requires_grad=True,
+    )
+    faces = torch.tensor([[0, 1, 2]], dtype=torch.int64)
+    frag_pix = torch.tensor([[0, 0, 0]], dtype=torch.int32)
+    frag_attrs = torch.tensor([[0.25, 0.25, 0.0, 1.0]], dtype=dtype)
+    frag_alpha = torch.zeros(1, dtype=dtype, requires_grad=True)
+    K = torch.tensor(
+        [[1.0, 0.0, 0.5], [0.0, 1.0, 0.5], [0.0, 0.0, 1.0]],
+        dtype=dtype,
+    )
+    Tcw = torch.eye(4, dtype=dtype).unsqueeze(0)
+    pixels = torch.tensor([[0, 0, 0]], dtype=torch.int64)
+
+    expected_surface = surface.vertex_expected_surface_samples(
+        vertices, faces, frag_pix, frag_attrs, frag_alpha,
+        K, Tcw, pixels, (1, 1),
+    )
+
+    assert not expected_surface.valid.item()
+    torch.testing.assert_close(
+        expected_surface.expected_camera_z, torch.zeros(1, dtype=dtype),
+    )
+    torch.testing.assert_close(
+        expected_surface.rendered_normal_camera,
+        torch.zeros(1, 3, dtype=dtype),
+    )
+    torch.testing.assert_close(
+        expected_surface.accumulated_opacity, torch.zeros(1, dtype=dtype),
+    )
+    (
+        expected_surface.expected_camera_z.sum()
+        + expected_surface.rendered_normal_camera.sum()
+    ).backward()
+    assert vertices.grad is not None
+    torch.testing.assert_close(vertices.grad, torch.zeros_like(vertices))
+    assert frag_alpha.grad is None
 
 
 def test_normal_loss_masks_invalid_surfaces_and_keeps_sample_count_denominator():
@@ -315,6 +501,39 @@ def test_expected_surface_background_depth_loss_is_zero_and_connected():
     torch.testing.assert_close(depth_loss, torch.tensor(0.0, dtype=dtype))
     depth_loss.backward()
     assert vertices.grad is not None
+
+
+def test_empty_prior_losses_are_zero_and_autograd_connected():
+    dtype = torch.float64
+    expected_camera_z = torch.empty(0, dtype=dtype, requires_grad=True)
+    expected_surface = surface.VertexExpectedSurfaceSamples(
+        torch.empty((0, 3), dtype=torch.int64),
+        expected_camera_z,
+        torch.empty((0, 3), dtype=dtype, requires_grad=True),
+        torch.empty(0, dtype=dtype, requires_grad=True),
+        torch.empty(0, dtype=torch.bool),
+    )
+    prior_inverse_depth = torch.empty(0, dtype=dtype, requires_grad=True)
+    prior_normal = torch.empty((0, 3), dtype=dtype, requires_grad=True)
+    prior_valid = torch.empty(0, dtype=torch.bool)
+
+    depth_loss = reg.inverse_depth_prior_loss(
+        expected_surface, prior_inverse_depth, prior_valid,
+    )
+    normal_loss = reg.normal_prior_loss(
+        expected_surface, prior_normal, prior_valid,
+    )
+
+    torch.testing.assert_close(depth_loss, torch.tensor(0.0, dtype=dtype))
+    torch.testing.assert_close(normal_loss, torch.tensor(0.0, dtype=dtype))
+    assert depth_loss.requires_grad and normal_loss.requires_grad
+    (depth_loss + normal_loss).backward()
+    assert expected_camera_z.grad is not None
+    torch.testing.assert_close(
+        expected_camera_z.grad, torch.empty(0, dtype=dtype),
+    )
+    assert prior_inverse_depth.grad is None
+    assert prior_normal.grad is None
 
 
 def test_saturated_float32_alpha_is_finite_across_pixel_groups():
@@ -690,6 +909,7 @@ def test_fragment_compositor_is_stable_across_many_pixel_groups():
     assert complete.all()
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_fragment_compositor_uses_nondefault_cuda_stream():
     device = torch.device("cuda")
@@ -888,6 +1108,7 @@ def test_expected_surface_no_fragment_match_returns_connected_zero():
     torch.testing.assert_close(vertices.grad, torch.zeros_like(vertices))
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cuda_fragments_integrate_with_expected_surface_and_prior_losses():
     device = torch.device("cuda")
@@ -990,6 +1211,7 @@ def test_cuda_fragments_integrate_with_expected_surface_and_prior_losses():
     assert prior_normal.grad is None
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cuda_pixel_fragment_csr_matches_full_fragment_search():
     device = torch.device("cuda")
@@ -1037,6 +1259,7 @@ def test_cuda_pixel_fragment_csr_matches_full_fragment_search():
     torch.testing.assert_close(search_grad, indexed_grad)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cuda_pixel_fragment_csr_handles_multibatch_invalid_and_stream_cases():
     device = torch.device("cuda")
@@ -1069,6 +1292,7 @@ def test_cuda_pixel_fragment_csr_handles_multibatch_invalid_and_stream_cases():
     assert empty_csr.fragment_indices.numel() == 0
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cuda_counter_rng_is_reproducible_and_semantic():
     rasterize_module = importlib.import_module("diffsoup.rasterize")

@@ -89,9 +89,9 @@ through `04_view_results.py`, `05_benchmark_fps.py`, `06_export_web.py`,
 Keep downloaded data in `datasets/`, training outputs in `results/`, exported
 assets in `web/data/`, paper material in `paper/`, and documentation images in
 `pics/`. `datasets/`, `results/`, `web/data/`, and `paper/` are ignored.
-`tests/` is ignored by default with explicit exceptions for selected regression
-files. Do not infer that an ignored or merely unignored local file is committed
-or supported solely because it exists on disk.
+`tests/` is ignored by default except for `test_*.py` regression sources. Do
+not infer that an ignored or merely unignored local file is committed or
+supported solely because it exists on disk.
 
 ## Training and Geometry-Prior Contracts
 
@@ -358,33 +358,31 @@ mode before comparing screenshots or hashes across surfaces.
 
 ## Testing, Profiling, and Validation
 
-`tests/test_regularization.py` is the tracked expected-surface and
-geometry-regularization regression file. `.gitignore` also explicitly
-unignores `tests/test_optimizer_state_migration.py`, which covers optimizer
-state transport and remesh provenance; confirm its tracked status separately
-with Git rather than equating "unignored" with "committed." There is no
-configured coverage threshold. Other `tests/` contents remain ignored, so
-local tests can be invisible to ordinary `rg --files`; inspect them with
-`Get-ChildItem tests` or `rg --no-ignore --files tests`, and use
-`git ls-files tests` to distinguish committed coverage from local-only files.
-A new test intended for review must be deliberately force-added or unignored
-and then confirmed in `git status`.
+All source files matching `tests/test_*.py` are explicitly unignored and are
+intended regression coverage. The suite covers expected surfaces and geometry
+losses, optimizer-state migration and remesh provenance, CUDA accumulation and
+fragment paths, geometry-prior preparation/loading, ColorMLP split inputs, SSIM
+backend parity, and the native clip-split endpoint policy. Confirm new files in
+`git status` and `git ls-files tests`; being unignored still does not mean a
+file has been committed. Do not treat stale `.pyc` files as source.
 
-Ignored local tests are development-only and must not be treated as committed
-coverage. The current local geometry-prior checks cover conditional depth,
-missing-surface masking, fixed-fragment gradients, per-view reliability,
-optional modality loading, schedule endpoints, removed CLI options, and COLMAP
-half-pixel coordinates. Do not treat stale `.pyc` files as source. Run the
-tracked test first, then any relevant ignored local checks that are present:
+Pytest configuration and the `cuda` / `native` markers live in
+`pyproject.toml`. CUDA tests must both carry the `cuda` marker and skip clearly
+when no GPU is available. Tests that import `diffsoup` exercise the installed
+package, so rebuild and reinstall after native or package changes before using
+them as a clean-checkout gate. Keep dataset/checkpoint performance tools out of
+`tests/`; use `02_mip360_test_profile.py` for training telemetry. Install the
+declared test dependencies with
+`python -m pip install --no-build-isolation ".[test]"`; `fused-ssim` remains a
+separately built submodule extension. There
+is no configured coverage threshold.
 
 ```bash
-python -m pytest -q -p no:cacheprovider tests/test_regularization.py
-python -m pytest -q -p no:cacheprovider tests/test_optimizer_state_migration.py
-# Additional ignored local checks, when present:
-python -m pytest -q -p no:cacheprovider tests/test_cuda_optimizations.py
-python -m pytest -q -p no:cacheprovider tests/test_geometry_priors.py
-python -m compileall -q python py_viewer examples
-pyrefly check --python-interpreter-path <activated-python> examples/utils.py examples/01_mip360.py examples/02_mip360_test.py examples/02_mip360_test_profile.py examples/03_random_init.py examples/08_prepare_geometry_priors.py py_viewer
+python -m pytest -q -p no:cacheprovider tests
+python -m pytest -q -p no:cacheprovider -m "not cuda" tests
+python -m pytest -q -p no:cacheprovider -m cuda tests
+python -m compileall -q python py_viewer examples tests
+pyrefly check --python-interpreter-path <activated-python> examples/utils.py examples/01_mip360.py examples/02_mip360_test.py examples/02_mip360_test_profile.py examples/03_random_init.py examples/08_prepare_geometry_priors.py py_viewer tests
 python examples/00_version.py
 ```
 
@@ -406,8 +404,8 @@ and accumulation-plan reuse, and non-default streams. SSIM changes require
 forward and prediction-gradient parity against `pytorch_msssim` with valid
 padding. Prior changes require focused tests for prior-file validation,
 fixed-fragment compositing, invalid/empty samples, face-forward normals,
-inverse-depth behavior, and finite-difference vertex gradients; reconcile the
-ignored stale tests with the actual intended API before using them as gates.
+inverse-depth behavior, and finite-difference vertex gradients; keep fixtures
+and compatibility cases aligned with the actual intended API.
 
 For performance work, establish correctness first, warm up, use CUDA events or
 explicit synchronization only around measurement, and report tensor shapes,
@@ -478,8 +476,8 @@ list exact validation commands and hardware/CUDA/OpenGL details, and include
 metric deltas or screenshots for CUDA, viewer, Web, or rendering changes.
 
 Do not commit datasets, checkpoints, result images, benchmark dumps, build
-products, virtual environments, generated Web data, or ignored local paper/test
-work unless the task explicitly changes that policy. When updating a submodule,
+products, virtual environments, generated Web data, or ignored local paper and
+benchmark work unless the task explicitly changes that policy. When updating a submodule,
 commit the intended gitlink and any necessary `.gitmodules` change together,
 verify `git submodule status`, and keep submodule build, wheel, egg-info, model,
 and cache artifacts untracked. `submodules/arag` intentionally uses

@@ -219,8 +219,7 @@ tests/
 /tests/
 /tests/**
 !/tests/
-!/tests/test_regularization.py
-!/tests/test_optimizer_state_migration.py
+!/tests/test_*.py
 
 paper/
 tmp/

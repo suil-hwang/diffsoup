@@ -13,6 +13,18 @@ dependencies = [
     "torch>=2.1.0"
 ]
 
+[project.optional-dependencies]
+test = [
+    "pytest>=8.2",
+    "numpy",
+    "imageio",
+    "torchvision",
+    "pytorch-msssim",
+    "scipy",
+    "matplotlib",
+    "open3d",
+]
+
 [tool.scikit-build]
 build.verbose = true
 wheel.packages = ["python/diffsoup"]
@@ -20,3 +32,12 @@ wheel.packages = ["python/diffsoup"]
 [tool.pyrefly]
 preset = "basic"
 search-path = [".", "src", "python", "examples"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+strict_markers = true
+markers = [
+    "cuda: requires a CUDA GPU and the built DiffSoup CUDA extension",
+    "native: requires the built DiffSoup native extension",
+]

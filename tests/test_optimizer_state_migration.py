@@ -20,10 +20,13 @@ VectorAdam = optimize.VectorAdam
 replace_optimizer_parameter_ = optimize.replace_optimizer_parameter_
 replace_vector_adam_parameter_ = optimize.replace_vector_adam_parameter_
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="optimizer-state migration requires CUDA",
-)
+pytestmark = [
+    pytest.mark.cuda,
+    pytest.mark.skipif(
+        not torch.cuda.is_available(),
+        reason="optimizer-state migration requires CUDA",
+    ),
+]
 
 DEVICE = torch.device("cuda")
 ADAM_OPTIONS = {
@@ -337,6 +340,82 @@ def test_vector_adam_identity_copy_preserves_state_and_next_step() -> None:
     )
 
 
+def test_initialized_vector_adam_subset_and_zero_row_migration() -> None:
+    old_parameter = _parameter(5, 3)
+    optimizer = VectorAdam([old_parameter], **VECTOR_OPTIONS)
+    for index in range(3):
+        gradient = (
+            torch.arange(15, dtype=torch.float32, device=DEVICE).reshape(5, 3)
+            / 9.0
+            - 0.4 * index
+        )
+        _step(optimizer, old_parameter, gradient)
+
+    old_state = _state_clone(optimizer.state[old_parameter])
+    parent_map = torch.tensor([4, 1, 1], dtype=torch.int32, device=DEVICE)
+    new_parameter = (
+        old_parameter.detach()
+        .index_select(0, parent_map.long())
+        .clone()
+        .requires_grad_()
+    )
+    replace_optimizer_parameter_(
+        optimizer,
+        old_parameter,
+        new_parameter,
+        parent_map,
+    )
+    expected_state = {
+        "step": old_state["step"],
+        "g1": old_state["g1"].index_select(0, parent_map.long()),
+        "g2": old_state["g2"].index_select(0, parent_map.long()),
+    }
+    _assert_exact_state(optimizer.state[new_parameter], expected_state)
+
+    reference_parameter = new_parameter.detach().clone().requires_grad_()
+    reference = VectorAdam([reference_parameter], **VECTOR_OPTIONS)
+    reference.state[reference_parameter] = _state_clone(expected_state)
+    next_gradient = torch.tensor(
+        [
+            [0.2, -0.1, 0.4],
+            [-0.7, 0.8, -0.3],
+            [0.6, -0.5, 0.9],
+        ],
+        dtype=torch.float32,
+        device=DEVICE,
+    )
+    _step(optimizer, new_parameter, next_gradient)
+    _step(reference, reference_parameter, next_gradient)
+    assert torch.equal(new_parameter, reference_parameter)
+    _assert_exact_state(
+        optimizer.state[new_parameter],
+        reference.state[reference_parameter],
+    )
+
+    state_before_empty = _state_clone(optimizer.state[new_parameter])
+    empty_map = torch.empty(0, dtype=torch.int64, device=DEVICE)
+    empty_parameter = torch.empty(
+        (0, 3),
+        dtype=torch.float32,
+        device=DEVICE,
+        requires_grad=True,
+    )
+    replace_optimizer_parameter_(
+        optimizer,
+        new_parameter,
+        empty_parameter,
+        empty_map,
+    )
+    expected_empty_state = {
+        "step": state_before_empty["step"],
+        "g1": state_before_empty["g1"].index_select(0, empty_map),
+        "g2": state_before_empty["g2"].index_select(0, empty_map),
+    }
+    assert optimizer.param_groups[0]["params"][0] is empty_parameter
+    assert new_parameter not in optimizer.state
+    _assert_exact_state(optimizer.state[empty_parameter], expected_empty_state)
+
+
 def test_vector_adam_direct_affine_recipe_preserves_next_step() -> None:
     old_parameter = _parameter(4, 3)
     optimizer = VectorAdam([old_parameter], **VECTOR_OPTIONS)
@@ -566,11 +645,21 @@ def test_native_midpoint_g2_transport_is_a_convex_warm_start() -> None:
         requires_grad=True,
     )
     faces = torch.tensor([[0, 1, 2]], dtype=torch.int32, device=DEVICE)
-    outputs = ds.split_triangle_soup(
-        vertices,
-        faces,
-        num_splits=1,
-        return_vertex_provenance=True,
+    outputs = cast(
+        tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ],
+        ds.split_triangle_soup(
+            vertices,
+            faces,
+            num_splits=1,
+            return_vertex_provenance=True,
+        ),
     )
     new_vertices, _, _, _, source_indices, source_weights = outputs
     new_vertices.requires_grad_(True)
@@ -656,10 +745,13 @@ def test_split_face_feature_alpha_values_and_moments_copy_parent_rows() -> None:
         dtype=torch.int32,
         device=DEVICE,
     )
-    _, _, face_map, _ = ds.split_triangle_soup(
-        vertices,
-        faces,
-        num_splits=1,
+    _, _, face_map, _ = cast(
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        ds.split_triangle_soup(
+            vertices,
+            faces,
+            num_splits=1,
+        ),
     )
     parent_map = face_map.long().contiguous()
     assert torch.equal(
@@ -766,11 +858,21 @@ def test_parent_row_copy_is_not_child_local_field_reparameterization() -> None:
         device=DEVICE,
     )
     faces = torch.tensor([[0, 1, 2]], dtype=torch.int32, device=DEVICE)
-    outputs = ds.split_triangle_soup(
-        vertices,
-        faces,
-        num_splits=1,
-        return_vertex_provenance=True,
+    outputs = cast(
+        tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ],
+        ds.split_triangle_soup(
+            vertices,
+            faces,
+            num_splits=1,
+            return_vertex_provenance=True,
+        ),
     )
     _, output_faces, face_map, _, source_indices, source_weights = outputs
     alpha_low = torch.sigmoid(torch.tensor(-2.0, device=DEVICE))
@@ -919,10 +1021,14 @@ def test_optimizer_migration_rejects_invalid_recipes() -> None:
     _step(adam, adam_old, torch.full_like(adam_old, 0.2))
     adam_state = _state_clone(adam.state[adam_old])
 
-    for parent_map in (
+    invalid_parent_maps = (
         torch.tensor([0], dtype=torch.int64, device=DEVICE),
         torch.tensor([0, 3], dtype=torch.int64, device=DEVICE),
-    ):
+        torch.tensor([0, -1], dtype=torch.int64, device=DEVICE),
+        torch.tensor([[0, 1]], dtype=torch.int64, device=DEVICE),
+        torch.tensor([0.0, 1.0], dtype=torch.float32, device=DEVICE),
+    )
+    for parent_map in invalid_parent_maps:
         with pytest.raises(AssertionError):
             replace_optimizer_parameter_(adam, adam_old, adam_new, parent_map)
         assert adam.param_groups[0]["params"][0] is adam_old
@@ -949,6 +1055,12 @@ def test_optimizer_migration_rejects_invalid_recipes() -> None:
             valid_weights,
         ),
         (
+            torch.tensor(
+                [[0, -1, 0], [1, 2, 1]], dtype=torch.int64, device=DEVICE
+            ),
+            valid_weights,
+        ),
+        (
             valid_indices,
             torch.tensor(
                 [[0.2, 0.7, 0.0], [0.2, 0.3, 0.5]],
@@ -956,6 +1068,34 @@ def test_optimizer_migration_rejects_invalid_recipes() -> None:
                 device=DEVICE,
             ),
         ),
+        (
+            valid_indices,
+            torch.tensor(
+                [[1.1, -0.1, 0.0], [0.2, 0.3, 0.5]],
+                dtype=torch.float32,
+                device=DEVICE,
+            ),
+        ),
+        (
+            valid_indices,
+            torch.tensor(
+                [[float("nan"), 0.0, 1.0], [0.2, 0.3, 0.5]],
+                dtype=torch.float32,
+                device=DEVICE,
+            ),
+        ),
+        (
+            torch.tensor(
+                [[0, 1], [1, 2]], dtype=torch.int64, device=DEVICE
+            ),
+            torch.tensor(
+                [[0.25, 0.75], [0.4, 0.6]],
+                dtype=torch.float32,
+                device=DEVICE,
+            ),
+        ),
+        (valid_indices.to(dtype=torch.float32), valid_weights),
+        (valid_indices, valid_weights.to(dtype=torch.float64)),
     )
     for recipe in invalid_recipes:
         with pytest.raises(AssertionError):
